@@ -233,7 +233,8 @@ func (e *Engine) Decide(ctx context.Context, text string) (decision RouteDecisio
 		}
 		return d
 	}
-	if Conversation(ctx) {
+	// Addressing Alice or a custom wake word again leaves the conversation.
+	if Conversation(ctx) && WakeWord(ctx) == "" && !strings.HasPrefix(dialogue.Normalize(text), "алиса") {
 		d := RouteDecision{Route: "llm", Source: "conversation"}
 		if e.Music != nil && e.Music.CanStartMusic(text) {
 			d.Route = "music"

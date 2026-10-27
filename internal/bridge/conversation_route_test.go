@@ -24,14 +24,20 @@ func TestDecideKeepsConversationAfterRules(t *testing.T) {
 	for _, tc := range []struct {
 		text, route, source string
 		conversation        bool
+		wake                string
 	}{
-		{"расскажи про марс", "yandex", "default", false},
-		{"расскажи про марс", "llm", "conversation", true},
-		{"стоп", "yandex", "rule", true},
+		{"расскажи про марс", "yandex", "default", false, ""},
+		{"расскажи про марс", "llm", "conversation", true, ""},
+		{"стоп", "yandex", "rule", true, ""},
+		{"Алиса, расскажи анекдот", "yandex", "default", true, ""},
+		{"расскажи анекдот", "yandex", "default", true, "джарвис"},
 	} {
 		ctx := t.Context()
 		if tc.conversation {
 			ctx = WithConversation(ctx)
+		}
+		if tc.wake != "" {
+			ctx = WithWakeWord(ctx, tc.wake)
 		}
 		if got := e.Decide(ctx, tc.text); got.Route != tc.route || got.Source != tc.source {
 			t.Errorf("%q conversation=%v: %+v", tc.text, tc.conversation, got)
@@ -126,5 +132,28 @@ func TestNativeKeepsConversationWhenSpeakerListensAfterLLMAnswer(t *testing.T) {
 				t.Fatal("second request not routed")
 			}
 		})
+	}
+}
+
+func TestArmConversationOnlyForSuccessfulNewestLLMAnswer(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		p      nativeRequest
+		latest string
+		listen bool
+		want   bool
+	}{
+		{"llm", nativeRequest{id: "a", route: "llm"}, "a", true, true},
+		{"no listen", nativeRequest{id: "a", route: "llm"}, "a", false, false},
+		{"home", nativeRequest{id: "a", route: "home"}, "a", true, false},
+		{"error answer", nativeRequest{id: "a", route: "llm", failed: true}, "a", true, false},
+		{"canceled", nativeRequest{id: "a", route: "llm", canceled: true}, "a", true, false},
+		{"newer request", nativeRequest{id: "a", route: "llm"}, "b", true, false},
+	} {
+		n := &Native{latest: tc.latest}
+		n.armConversation(&tc.p, tc.listen)
+		if got := n.listening == "a"; got != tc.want {
+			t.Errorf("%s: armed=%v, want %v", tc.name, got, tc.want)
+		}
 	}
 }

@@ -75,6 +75,7 @@ type nativeRequest struct {
 	soundSealed                     bool
 	expires                         *time.Timer
 	wake                            chan string
+	failed                          bool
 }
 type Native struct {
 	connectionScope  string
@@ -102,8 +103,10 @@ type Native struct {
 	// KeepConversation keeps the LLM route for a voice request that the speaker
 	// opens on its own right after a fully played LLM answer (listen_after_reply).
 	KeepConversation bool
-	// listening is the last LLM answer that asked the speaker to listen again;
-	// played is the last request whose answer finished playing uninterrupted.
+	// latest is the newest request; listening is the last LLM answer that asked
+	// the speaker to listen again; played is the last request whose answer
+	// finished playing uninterrupted.
+	latest    string
 	listening string
 	played    playedAnswer
 }
@@ -159,8 +162,9 @@ func (n *Native) Client(ctx context.Context, k websocket.MessageType, data []byt
 		timestamps := stat.GetTimestamps()
 		reported := func(value string) bool { return value != "" && value != "0" }
 		finished := reported(timestamps.GetOnSoundPlayerEndTime()) || reported(timestamps.GetOnPlayerEnd())
-		slog.Info("native_playback_status", "request", requestTag(stat.GetRequestMessageId()), "error_class", kind, "playback_reported", reported(timestamps.GetOnSoundPlayerBeginTime()) || reported(timestamps.GetOnPlayerBegin()), "finished_reported", finished)
-		if finished && !reported(timestamps.GetOnInterruptionPhraseSpottedTime()) {
+		interrupted := reported(timestamps.GetOnInterruptionPhraseSpottedTime())
+		slog.Info("native_playback_status", "request", requestTag(stat.GetRequestMessageId()), "error_class", kind, "playback_reported", reported(timestamps.GetOnSoundPlayerBeginTime()) || reported(timestamps.GetOnPlayerBegin()), "finished_reported", finished, "interrupted", interrupted)
+		if finished && !interrupted {
 			n.mu.Lock()
 			n.played = playedAnswer{id: stat.GetRequestMessageId(), at: time.Now()}
 			n.mu.Unlock()
@@ -243,12 +247,22 @@ func (n *Native) Client(ctx context.Context, k websocket.MessageType, data []byt
 			}
 		})
 		n.requests[id] = p
-		if n.KeepConversation && !p.isText && n.listening != "" && n.played.id == n.listening && received.Sub(n.played.at) < followGap {
-			p.ctx = WithConversation(p.ctx)
-			slog.Info("native_conversation", "request", requestTag(id), "after", requestTag(n.listening))
+		if n.KeepConversation && n.listening != "" {
+			switch {
+			case p.isText:
+				slog.Info("native_conversation_ended", "request", requestTag(id), "reason", "text")
+			case n.played.id != n.listening:
+				slog.Info("native_conversation_ended", "request", requestTag(id), "reason", "not_played")
+			case received.Sub(n.played.at) >= followGap:
+				slog.Info("native_conversation_ended", "request", requestTag(id), "reason", "late", "gap_ms", received.Sub(n.played.at).Milliseconds())
+			default:
+				p.ctx = WithConversation(p.ctx)
+				slog.Info("native_conversation", "request", requestTag(id), "after", requestTag(n.listening))
+			}
 		}
 		// Any later request ends the conversation unless it is answered by the LLM again.
 		n.listening = ""
+		n.latest = id
 		if n.OnStart != nil {
 			n.OnStart(id)
 		}
@@ -497,6 +511,7 @@ func (n *Native) Server(ctx context.Context, k websocket.MessageType, data []byt
 
 		if resolver, ok := n.resolver.(FallbackResolver); ok && n.isRefusal(text) {
 			p.local = true
+			p.route = "llm"
 			if n.OnRoute != nil {
 				n.OnRoute(p.id, "llm")
 			}
@@ -516,6 +531,9 @@ func (n *Native) Server(ctx context.Context, k websocket.MessageType, data []byt
 				if err != nil {
 					n.discardSound(p)
 					result.Answer = "Сейчас не получилось получить ответ локальной модели."
+					n.mu.Lock()
+					p.failed = true
+					n.mu.Unlock()
 				}
 				_ = n.sendCancel(p.ctx, p.id)
 				if err := n.reply(p, result.Answer); err != nil {
@@ -640,6 +658,7 @@ func (n *Native) maybeResolve(p *nativeRequest) {
 			n.OnRoute(p.id, result.Route)
 		}
 		p.route = result.Route
+		p.failed = err != nil
 		if result.Route == "yandex" {
 			p.cloud = true
 			var err error
@@ -715,16 +734,22 @@ func (n *Native) reply(p *nativeRequest, text string) error {
 	if err := n.down(p.ctx, websocket.MessageBinary, b); err != nil {
 		return err
 	}
-	if answer.VoiceResponse.ShouldListen && p.route == "llm" {
-		n.mu.Lock()
-		n.listening = p.id
-		n.mu.Unlock()
-	}
+	n.armConversation(p, answer.VoiceResponse.ShouldListen)
 	n.captureDelivered(p, text, true, silentPlayback || len(answer.Response.Directives) > 0, true)
 	if silentPlayback {
 		return nil
 	}
 	return n.synthesize(p, text)
+}
+
+// armConversation lets the request the speaker opens after this answer continue
+// the conversation: only for a successful LLM answer to the newest request.
+func (n *Native) armConversation(p *nativeRequest, listen bool) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if listen && p.route == "llm" && !p.failed && !p.canceled && n.latest == p.id {
+		n.listening = p.id
+	}
 }
 func (n *Native) synthesize(p *nativeRequest, text string) error {
 	t := &client.TClientMessage{Message: &client.TClientMessage_Event{Event: &client.TClientMessage_TEvent{Header: &header.TEventHeader{MessageId: p.ttsID}, Event: &client.TClientMessage_TEvent_TtsGenerate{TtsGenerate: &tts.TTtsGenerate{Text: new(text), Lang: new("ru-RU"), Format: new("audio/opus")}}}}}
