@@ -13,14 +13,26 @@ import zipfile
 ROOT = Path(__file__).resolve().parents[1]
 PAYLOAD = ("plugin.toml", "start.sh", "control.sh", "S98quasar-yam", "config.device.example.json")
 
-def build(output, binary=None, tag=None):
-    manifest = tomllib.loads((ROOT / "packaging/yam/plugin.toml").read_text())
+def build(output, binary=None, tag=None, suffix=None):
+    manifest_text = (ROOT / "packaging/yam/plugin.toml").read_text()
+    manifest = tomllib.loads(manifest_text)
     if tag is not None:
         if not re.fullmatch(r"v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)", tag):
             raise ValueError("release tag must be vMAJOR.MINOR.PATCH (stable versions only)")
         if tag[1:] != manifest["version"]:
             raise ValueError("release tag does not match packaging/yam/plugin.toml version")
-    output = Path(output or ROOT / f'dist/quasar-bridge-{manifest["version"]}-linux-arm64.yap').resolve()
+    version = manifest["version"]
+    if suffix is not None:
+        # SemVer build metadata keeps the upstream version comparable while marking the build.
+        if tag is not None:
+            raise ValueError("build suffix is not allowed for release tags")
+        if not re.fullmatch(r"[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*", suffix):
+            raise ValueError("build suffix must be dot-separated [0-9A-Za-z-] identifiers")
+        version += "+" + suffix
+        manifest_text, count = re.subn(r'(?m)^version = "[^"]*"$', f'version = "{version}"', manifest_text)
+        if count != 1:
+            raise ValueError("plugin.toml must contain exactly one version line")
+    output = Path(output or ROOT / f'dist/quasar-bridge-{version}-linux-arm64.yap').resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="quasar-yap-") as tmp:
         executable = Path(binary).resolve() if binary else Path(tmp) / "quasar-bridge"
@@ -40,7 +52,8 @@ def build(output, binary=None, tag=None):
                 info = zipfile.ZipInfo(name, (2026, 1, 1, 0, 0, 0))
                 info.create_system = 3
                 info.external_attr = (0o100755 if name.endswith('.sh') or name.startswith(('bin/', 'S98')) else 0o100644) << 16
-                archive.writestr(info, path.read_bytes(), compress_type=zipfile.ZIP_DEFLATED, compresslevel=9)
+                data = manifest_text.encode() if name == "plugin.toml" else path.read_bytes()
+                archive.writestr(info, data, compress_type=zipfile.ZIP_DEFLATED, compresslevel=9)
     digest = hashlib.sha256(output.read_bytes()).hexdigest()
     output.with_suffix(output.suffix + ".sha256").write_text(f"{digest}  {output.name}\n")
     print(output)
@@ -51,5 +64,6 @@ if __name__ == "__main__":
     parser.add_argument("--output")
     parser.add_argument("--binary", help="prebuilt static Linux ARM64 executable")
     parser.add_argument("--tag", help="require a stable vMAJOR.MINOR.PATCH tag matching plugin.toml")
+    parser.add_argument("--suffix", help="append SemVer build metadata to the package version, e.g. mrkiirya.12")
     args = parser.parse_args()
-    build(args.output, args.binary, args.tag)
+    build(args.output, args.binary, args.tag, args.suffix)
