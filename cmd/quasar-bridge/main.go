@@ -23,6 +23,7 @@ import (
 	"quasarbridge/internal/bridge"
 	"quasarbridge/internal/dialogue"
 	"quasarbridge/internal/home"
+	"quasarbridge/internal/indicator"
 	"quasarbridge/internal/journal"
 	"quasarbridge/internal/llm"
 	"quasarbridge/internal/wire"
@@ -257,6 +258,26 @@ func main() {
 			return n
 		}
 	}
+	// A run killed mid-takeover leaves the ring frozen; repair it even when the indicator is off.
+	indicator.Cleanup(indicator.DefaultRoot)
+	// Routes are only reported by native hybrid sessions, so observe mode never recolors the ring.
+	var ring *indicator.Ring
+	switch {
+	case !cfg.RouteIndicator.Enabled:
+	case cfg.Mode != "hybrid":
+		slog.Warn("route_indicator_unavailable", "reason", "hybrid mode required")
+	default:
+		if ring, err = indicator.New(cfg.RouteIndicator, indicator.DefaultRoot, indicator.DefaultStandIns); err != nil {
+			slog.Warn("route_indicator_unavailable", "error", err)
+		} else if ring == nil {
+			slog.Warn("route_indicator_unavailable", "reason", "no RGB LED ring found")
+		} else {
+			proxy.OnRoute = ring.Route
+			proxy.OnStart = ring.Start
+			defer ring.Off()
+			slog.Info("route_indicator", "zones", ring.Zones())
+		}
+	}
 	mux := http.NewServeMux()
 	if musicQueue != nil {
 		mux.Handle("/music-stream/", musicQueue)
@@ -272,7 +293,7 @@ func main() {
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		state := engine.RoutingStatus()
-		data, _ := json.Marshal(map[string]any{"status": "ok", "mode": cfg.Mode, "client_frames": clientCount.Load(), "server_frames": serverCount.Load(), "routing_revision": state.Revision, "routing_rules": state.ActiveRules, "conversation_log_enabled": logs.Enabled(), "conversation_log_failures": logs.Failures(), "assistant_tools_enabled": cfg.AssistantTools.Enabled, "dialogue_context_enabled": cfg.DialogueContext.Enabled && cfg.Mode == "hybrid", "home_assistant_enabled": hc != nil && cfg.Mode == "hybrid", "mcp_servers_configured": mcpConfigured, "music_playback_enabled": musicQueue != nil})
+		data, _ := json.Marshal(map[string]any{"status": "ok", "mode": cfg.Mode, "client_frames": clientCount.Load(), "server_frames": serverCount.Load(), "routing_revision": state.Revision, "routing_rules": state.ActiveRules, "conversation_log_enabled": logs.Enabled(), "conversation_log_failures": logs.Failures(), "assistant_tools_enabled": cfg.AssistantTools.Enabled, "dialogue_context_enabled": cfg.DialogueContext.Enabled && cfg.Mode == "hybrid", "home_assistant_enabled": hc != nil && cfg.Mode == "hybrid", "mcp_servers_configured": mcpConfigured, "music_playback_enabled": musicQueue != nil, "route_indicator_enabled": ring != nil})
 		_, _ = w.Write(data)
 	})
 	mux.Handle("/uni.ws", proxy)
