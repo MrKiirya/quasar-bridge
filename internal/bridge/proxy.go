@@ -94,6 +94,9 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if n, ok := session.(*Native); ok {
 			n.OnRoute = routeHook(trace, p.OnRoute)
 			n.OnStart = p.OnStart
+			if trace != nil {
+				n.OnWakeWord = trace.wakeWord
+			}
 		}
 		defer session.Close()
 	}

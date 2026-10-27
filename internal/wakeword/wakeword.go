@@ -11,7 +11,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"strings"
+	"sync"
 	"time"
 )
 
@@ -43,6 +43,11 @@ type Client struct {
 	url    string
 	window time.Duration
 	http   *http.Client
+
+	mu sync.Mutex
+	// claimed is the time of the last hit given to a request: each hit opens
+	// at most one request. Times survive a detector restart, its hit ids do not.
+	claimed time.Time
 }
 
 func New(cfg Config) *Client {
@@ -55,45 +60,56 @@ type hit struct {
 	Fired bool      `json:"fired"`
 }
 
-// Word returns the lower-cased id of the custom word that woke the speaker
-// for a voice request received at `at`. It returns "" when the stock spotter
-// did, or when the detector does not answer in time.
+// Word returns the id of the custom word that woke the speaker for a voice
+// request received at `at` and claims that hit. It returns "" when the stock
+// spotter did, or when the detector does not answer in time.
 func (c *Client) Word(ctx context.Context, at time.Time) string {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.url, nil)
+	hits, err := c.hits(ctx)
 	if err != nil {
 		return ""
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	h := pick(hits, at, c.window, c.claimed)
+	if h == nil {
+		return ""
+	}
+	c.claimed = h.At
+	return h.Word
+}
+func (c *Client) hits(ctx context.Context) ([]hit, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.url, nil)
+	if err != nil {
+		return nil, err
 	}
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return ""
+		return nil, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return ""
+		return nil, errors.New("wake word detector status " + resp.Status)
 	}
 	var state struct {
 		Hits []hit `json:"hits"`
 	}
-	if json.UnmarshalRead(io.LimitReader(resp.Body, 1<<20), &state) != nil {
-		return ""
+	if err := json.UnmarshalRead(io.LimitReader(resp.Body, 1<<20), &state); err != nil {
+		return nil, err
 	}
-	return pick(state.Hits, at, c.window)
+	return state.Hits, nil
 }
 
-// pick takes the newest fired hit within window before `at`.
-func pick(hits []hit, at time.Time, window time.Duration) string {
+// pick takes the newest unclaimed fired hit within window before `at`.
+func pick(hits []hit, at time.Time, window time.Duration, claimed time.Time) *hit {
 	var best *hit
 	for i := range hits {
 		h := &hits[i]
-		if !h.Fired || h.Word == "" || h.At.Before(at.Add(-window)) || h.At.After(at.Add(skew)) {
+		if !h.Fired || h.Word == "" || !h.At.After(claimed) || h.At.Before(at.Add(-window)) || h.At.After(at.Add(skew)) {
 			continue
 		}
 		if best == nil || h.At.After(best.At) {
 			best = h
 		}
 	}
-	if best == nil {
-		return ""
-	}
-	return strings.ToLower(best.Word)
+	return best
 }

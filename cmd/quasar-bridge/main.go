@@ -36,6 +36,7 @@ func main() {
 	check := flag.Bool("check-backends", false, "check LLM and configured Home Assistant connectivity")
 	checkMCP := flag.Bool("check-mcp", false, "connect to configured MCP servers and list tools without executing them")
 	route := flag.String("route", "", "explain a route without executing home actions or generating an answer")
+	routeWake := flag.String("wake-word", "", "with -route: the custom wake word that opened the request")
 	validate := flag.Bool("check-config", false, "validate configuration without contacting backends")
 	speakerAction := flag.String("speaker-endpoint", "", "apply or rollback the on-device loopback endpoint (requires writable firmware)")
 	speakerConfig := flag.String("speaker-config", "/system/vendor/quasar/quasar.cfg", "firmware configuration path")
@@ -196,6 +197,9 @@ func main() {
 		ctx, cancel := context.WithTimeout(context.Background(), 75*time.Second)
 		defer cancel()
 		if *route != "" {
+			if *routeWake != "" {
+				ctx = bridge.WithWakeWord(ctx, *routeWake)
+			}
 			data, _ := json.Marshal(engine.Decide(ctx, *route))
 			fmt.Println(string(data))
 			return

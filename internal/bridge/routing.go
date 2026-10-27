@@ -65,6 +65,7 @@ type RoutingPolicy struct {
 	classifier                      ClassifierConfig
 	refusalEnabled                  bool
 	refusalPrefixes, refusalPhrases []string
+	wakeWord                        bool
 	revision                        string
 }
 
@@ -98,9 +99,10 @@ func DefaultRoutingConfig() RoutingConfig {
 
 type wakeWordKey struct{}
 
-// WithWakeWord records the custom wake word that opened a voice request.
+// WithWakeWord records the custom wake word that opened a voice request,
+// folded like wake_word_any terms.
 func WithWakeWord(ctx context.Context, word string) context.Context {
-	return context.WithValue(ctx, wakeWordKey{}, strings.ToLower(word))
+	return context.WithValue(ctx, wakeWordKey{}, strings.Join(strings.Fields(strings.ToLower(word)), " "))
 }
 
 // WakeWord returns the custom wake word of the request, "" for the stock one.
@@ -180,6 +182,7 @@ func CompileRouting(cfg RoutingConfig) (*RoutingPolicy, error) {
 		}
 		if !rule.Disabled {
 			p.rules = append(p.rules, r)
+			p.wakeWord = p.wakeWord || len(r.wake) > 0
 		}
 	}
 	var err error
