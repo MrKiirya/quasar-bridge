@@ -263,13 +263,18 @@ func main() {
 			return n
 		}
 	}
-	ring := indicator.New(cfg.RouteIndicator, indicator.DefaultRoot)
-	if ring != nil {
-		proxy.OnRoute = ring.Route
-		defer ring.Off()
-		slog.Info("route_indicator", "zones", ring.Zones())
-	} else if cfg.RouteIndicator.Enabled {
-		slog.Warn("route_indicator_unavailable", "reason", "no RGB LED ring found")
+	// Routes are only reported by native hybrid sessions, so observe mode never recolors the ring.
+	var ring *indicator.Ring
+	if cfg.RouteIndicator.Enabled && cfg.Mode == "hybrid" {
+		if ring, err = indicator.New(cfg.RouteIndicator, indicator.DefaultRoot, indicator.DefaultStandIns); err != nil {
+			slog.Warn("route_indicator_unavailable", "error", err)
+		} else if ring == nil {
+			slog.Warn("route_indicator_unavailable", "reason", "no RGB LED ring found")
+		} else {
+			proxy.OnRoute = ring.Route
+			defer ring.Off()
+			slog.Info("route_indicator", "zones", ring.Zones())
+		}
 	}
 	mux := http.NewServeMux()
 	if musicQueue != nil {

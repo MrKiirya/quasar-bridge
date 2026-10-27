@@ -260,15 +260,15 @@ func TestRouteIndicatorConfig(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.RouteIndicator.Enabled || cfg.RouteIndicator.DurationMS != 4000 || cfg.RouteIndicator.Colors["llm"] == "" {
+	if d := cfg.RouteIndicator; d.Enabled || d.IdleMS != 600 || d.MaxMS != 60000 || d.Colors["llm"] == "" || d.Colors["yandex"] != "" {
 		t.Fatalf("route_indicator defaults: %+v", cfg.RouteIndicator)
 	}
-	cfg, err = readConfig(configFile(t, `{"route_indicator":{"enabled":true,"duration_ms":2500,"colors":{"llm":"#ff0000","yandex":""}}}`))
+	cfg, err = readConfig(configFile(t, `{"route_indicator":{"enabled":true,"idle_ms":900,"colors":{"llm":"#ff0000","music":""}}}`))
 	if err != nil {
 		t.Fatal(err)
 	}
 	c := cfg.RouteIndicator
-	if !c.Enabled || c.DurationMS != 2500 || c.Colors["llm"] != "#ff0000" || c.Colors["yandex"] != "" {
+	if !c.Enabled || c.IdleMS != 900 || c.MaxMS != 60000 || c.Colors["llm"] != "#ff0000" || c.Colors["music"] != "" {
 		t.Fatalf("route_indicator overlay: %+v", c)
 	}
 	// Listed colors overlay the defaults; routes left out keep their default color.
@@ -278,7 +278,8 @@ func TestRouteIndicatorConfig(t *testing.T) {
 	for _, body := range []string{
 		`{"route_indicator":{"colors":{"llm":"red"}}}`,
 		`{"route_indicator":{"colors":{"classify":"#ffffff"}}}`,
-		`{"route_indicator":{"duration_ms":10}}`,
+		`{"route_indicator":{"idle_ms":10}}`,
+		`{"route_indicator":{"duration_ms":4000}}`,
 	} {
 		if _, err := readConfig(configFile(t, body)); err == nil {
 			t.Fatalf("accepted %s", body)
