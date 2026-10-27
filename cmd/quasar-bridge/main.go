@@ -263,15 +263,22 @@ func main() {
 			return n
 		}
 	}
+	// A run killed mid-takeover leaves the ring frozen; repair it even when the indicator is off.
+	indicator.Cleanup(indicator.DefaultRoot)
 	// Routes are only reported by native hybrid sessions, so observe mode never recolors the ring.
 	var ring *indicator.Ring
-	if cfg.RouteIndicator.Enabled && cfg.Mode == "hybrid" {
+	switch {
+	case !cfg.RouteIndicator.Enabled:
+	case cfg.Mode != "hybrid":
+		slog.Warn("route_indicator_unavailable", "reason", "hybrid mode required")
+	default:
 		if ring, err = indicator.New(cfg.RouteIndicator, indicator.DefaultRoot, indicator.DefaultStandIns); err != nil {
 			slog.Warn("route_indicator_unavailable", "error", err)
 		} else if ring == nil {
 			slog.Warn("route_indicator_unavailable", "reason", "no RGB LED ring found")
 		} else {
 			proxy.OnRoute = ring.Route
+			proxy.OnStart = ring.Start
 			defer ring.Off()
 			slog.Info("route_indicator", "zones", ring.Zones())
 		}
