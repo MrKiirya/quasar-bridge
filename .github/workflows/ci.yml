@@ -34,7 +34,8 @@ jobs:
           if [ "$GITHUB_REF_TYPE" = tag ]; then
             python3 scripts/build-yap.py --tag "$GITHUB_REF_NAME"
           else
-            python3 scripts/build-yap.py
+            # Fork builds carry the run number so YAM shows which build is installed.
+            python3 scripts/build-yap.py --suffix "mrkiirya.$GITHUB_RUN_NUMBER"
           fi
       - name: Keep release assets
         if: inputs.upload-yap
