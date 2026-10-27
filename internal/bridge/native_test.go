@@ -545,3 +545,28 @@ func TestExistingNativeSessionUsesReloadedRoute(t *testing.T) {
 		}
 	}
 }
+
+func TestNativeReportsRequestStartBeforeRoute(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	events := make(chan string, 4)
+	n := NewNative(ctx, func(context.Context, websocket.MessageType, []byte) error { return nil }, func(context.Context, websocket.MessageType, []byte) error { return nil }, resolverFunc(func(context.Context, string) (Resolution, error) { return Resolution{Route: "yandex"}, nil }))
+	defer n.Close()
+	n.GateText = true
+	n.OnStart = func(id string) { events <- "start " + id }
+	n.OnRoute = func(id, route string) { events <- "route " + id + " " + route }
+	input := aa(&client.TClientMessage{Message: &client.TClientMessage_Event{Event: &client.TClientMessage_TEvent{Header: &header.TEventHeader{MessageId: "start-id"}, Event: &client.TClientMessage_TEvent_TextInput{TextInput: &request.TAliceRequestProto{Request: &request.TAliceRequestProto_TRequest{Event: &common.TEvent{Text: new("погода")}}}}}}})
+	if err := n.Client(ctx, websocket.MessageBinary, input); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"start start-id", "route start-id yandex"} {
+		select {
+		case got := <-events:
+			if got != want {
+				t.Fatalf("event = %q, want %q", got, want)
+			}
+		case <-ctx.Done():
+			t.Fatalf("missing %q", want)
+		}
+	}
+}

@@ -19,6 +19,8 @@ type Proxy struct {
 	NewSession func(context.Context, Sender, Sender) Session
 	// OnRoute is told the route of each native request, after the journal.
 	OnRoute func(id, route string)
+	// OnStart is told when a native request begins, before its route is known.
+	OnStart func(id string)
 }
 
 type Sender func(context.Context, websocket.MessageType, []byte) error
@@ -91,6 +93,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		session = p.NewSession(ctx, up.Write, downSend)
 		if n, ok := session.(*Native); ok {
 			n.OnRoute = routeHook(trace, p.OnRoute)
+			n.OnStart = p.OnStart
 		}
 		defer session.Close()
 	}

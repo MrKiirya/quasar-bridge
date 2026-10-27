@@ -88,6 +88,7 @@ type Native struct {
 	blocked          map[uint32]*nativeRequest
 	wg               sync.WaitGroup
 	OnRoute          func(id, route string)
+	OnStart          func(id string)
 	GateText         bool
 	ShouldListen     bool
 	DecisionDelay    time.Duration
@@ -204,6 +205,9 @@ func (n *Native) Client(ctx context.Context, k websocket.MessageType, data []byt
 			}
 		})
 		n.requests[id] = p
+		if n.OnStart != nil {
+			n.OnStart(id)
+		}
 		n.mu.Unlock()
 		if p.gated {
 			gated, err := wire.EnableApproval(f)
