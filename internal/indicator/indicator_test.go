@@ -14,11 +14,13 @@ import (
 // fakeMounter records bind mounts; the test plays the firmware by writing into stand-ins.
 type fakeMounter struct {
 	mu      sync.Mutex
-	bound   map[string]bool
+	bound   map[string]int // stacked mounts per target
 	binds   int
 	unbinds int
 	failAt  int // fail the n-th Bind (1-based); 0 never fails
 }
+
+func newMounter() *fakeMounter { return &fakeMounter{bound: map[string]int{}} }
 
 func (m *fakeMounter) Bind(_, target string) error {
 	m.mu.Lock()
@@ -27,7 +29,7 @@ func (m *fakeMounter) Bind(_, target string) error {
 	if m.failAt != 0 && m.binds == m.failAt {
 		return errors.New("bind failed")
 	}
-	m.bound[target] = true
+	m.bound[target]++
 	return nil
 }
 
@@ -35,17 +37,29 @@ func (m *fakeMounter) Unbind(target string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.unbinds++
-	if !m.bound[target] {
+	if m.bound[target] == 0 {
 		return errors.New("not mounted")
 	}
-	delete(m.bound, target)
+	m.bound[target]--
 	return nil
 }
+
+func (m *fakeMounter) Real(*os.File) error { return nil }
 
 func (m *fakeMounter) mounted() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return len(m.bound)
+	n := 0
+	for _, c := range m.bound {
+		n += c
+	}
+	return n
+}
+
+func (m *fakeMounter) bindCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.binds
 }
 
 // fakeLEDs creates sysfs-like brightness files for zones 1..n under a temp root.
@@ -58,7 +72,7 @@ func fakeLEDs(t *testing.T, prefix string, n int) string {
 			if err := os.MkdirAll(dir, 0o755); err != nil {
 				t.Fatal(err)
 			}
-			if err := os.WriteFile(filepath.Join(dir, "brightness"), []byte("0\n"), 0o644); err != nil {
+			if err := os.WriteFile(filepath.Join(dir, "brightness"), []byte("000\n"), 0o644); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -93,6 +107,16 @@ func firmware(t *testing.T, r *Ring, zone int, rgb [3]int) {
 	}
 }
 
+// setLED writes a zone's real LED files, e.g. the firmware's frame before a takeover.
+func setLED(t *testing.T, r *Ring, zone int, rgb [3]int) {
+	t.Helper()
+	for i, c := range r.zones[zone] {
+		if err := os.WriteFile(c.path, []byte(strconv.Itoa(rgb[i])+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 func ledValue(t *testing.T, r *Ring, zone int) [3]int {
 	t.Helper()
 	var out [3]int
@@ -117,6 +141,12 @@ func eventually(t *testing.T, what string, ok func() bool) {
 	}
 }
 
+var (
+	alicePurple = [3]int{0x6b, 0x0f, 0xff}
+	claude      = [3]int{0xd9, 0x77, 0x57}
+	homeBlue    = [3]int{0x18, 0xbc, 0xf2}
+)
+
 func TestValidate(t *testing.T) {
 	if err := DefaultConfig().Validate(); err != nil {
 		t.Fatal(err)
@@ -138,7 +168,7 @@ func TestValidate(t *testing.T) {
 }
 
 func TestNewNeedsEnabledCompleteRing(t *testing.T) {
-	m := &fakeMounter{bound: map[string]bool{}}
+	m := newMounter()
 	root := fakeLEDs(t, "mini2", 6)
 	if r, err := newRing(DefaultConfig(), root, t.TempDir(), m); r != nil || err != nil {
 		t.Fatalf("disabled indicator: %v, %v", r, err)
@@ -161,45 +191,94 @@ func TestNewNeedsEnabledCompleteRing(t *testing.T) {
 	}
 }
 
-func TestNewClearsLeftoverStandInsBeforeOpening(t *testing.T) {
-	m := &fakeMounter{bound: map[string]bool{}}
-	r := newTestRing(t, 6, config(600, 60000), m)
-	if m.unbinds != 18 || m.binds != 0 {
-		t.Fatalf("startup unbinds = %d, binds = %d; want 18 and 0", m.unbinds, m.binds)
+func TestNewPeelsStackedLeftoversBeforeOpening(t *testing.T) {
+	m := newMounter()
+	root := fakeLEDs(t, "mini2", 6)
+	red := filepath.Join(root, "mini2:red:ring3", "brightness")
+	m.bound[red] = 3
+	cfg := DefaultConfig()
+	cfg.Enabled = true
+	r, err := newRing(cfg, root, t.TempDir(), m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Off()
+	if m.mounted() != 0 || m.binds != 0 {
+		t.Fatalf("mounted = %d, binds = %d after startup; leftovers must be peeled", m.mounted(), m.binds)
 	}
 	if !strings.Contains(r.zones[0][0].standIn, "mini2_red_ring1") {
 		t.Fatalf("stand-in name: %s", r.zones[0][0].standIn)
 	}
 }
 
+func TestNewRejectsHandleThatIsNotRealLED(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Enabled = true
+	m := &rejectingMounter{fakeMounter: newMounter()}
+	if r, err := newRing(cfg, fakeLEDs(t, "mini2", 2), t.TempDir(), m); r != nil || err == nil {
+		t.Fatalf("newRing = %v, %v; want an error", r, err)
+	}
+}
+
+type rejectingMounter struct{ *fakeMounter }
+
+func (*rejectingMounter) Real(*os.File) error { return errors.New("not a sysfs file") }
+
+func TestCleanupRunsWithoutRing(t *testing.T) {
+	m := newMounter()
+	root := fakeLEDs(t, "mini2", 2)
+	blue := filepath.Join(root, "mini2:blue:ring2", "brightness")
+	m.bound[blue] = 2
+	cleanup(root, m)
+	if m.mounted() != 0 {
+		t.Fatalf("%d stand-ins left after cleanup", m.mounted())
+	}
+}
+
 func TestZonesSortedNumerically(t *testing.T) {
-	r := newTestRing(t, 10, config(600, 60000), &fakeMounter{bound: map[string]bool{}})
+	r := newTestRing(t, 10, config(600, 60000), newMounter())
 	if !strings.Contains(r.zones[1][0].path, "ring2") || !strings.Contains(r.zones[9][0].path, "ring10") {
 		t.Fatalf("zone order: %s ... %s", r.zones[1][0].path, r.zones[9][0].path)
 	}
 }
 
 func TestRecolorsFirmwareFramesKeepingBrightness(t *testing.T) {
-	m := &fakeMounter{bound: map[string]bool{}}
+	m := newMounter()
 	r := newTestRing(t, 6, config(600, 60000), m)
+	setLED(t, r, 0, alicePurple)
 	r.Route("a", "llm")
 	eventually(t, "takeover", func() bool { return m.mounted() == 18 })
-	firmware(t, r, 0, [3]int{0x6b, 0x0f, 0xff})
+	eventually(t, "frame copied at takeover", func() bool { return ledValue(t, r, 0) == claude })
 	firmware(t, r, 1, [3]int{0, 0, 128})
-	eventually(t, "full zone", func() bool { return ledValue(t, r, 0) == [3]int{217, 119, 87} })
 	eventually(t, "half zone", func() bool { return ledValue(t, r, 1) == [3]int{109, 60, 44} })
 	if got := ledValue(t, r, 2); got != ([3]int{}) {
 		t.Fatalf("dark zone = %v", got)
 	}
 }
 
-func TestReleasesWhenFirmwareGoesDark(t *testing.T) {
-	m := &fakeMounter{bound: map[string]bool{}}
-	r := newTestRing(t, 6, config(100, 60000), m)
+func TestEmptyStandInKeepsPreviousLevel(t *testing.T) {
+	m := newMounter()
+	r := newTestRing(t, 1, config(600, 60000), m)
+	setLED(t, r, 0, alicePurple)
+	r.Route("a", "llm")
+	eventually(t, "recolor", func() bool { return ledValue(t, r, 0) == claude })
+	for _, c := range r.zones[0] {
+		if err := os.WriteFile(c.standIn, nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	time.Sleep(100 * time.Millisecond)
+	if got := ledValue(t, r, 0); got != claude {
+		t.Fatalf("truncated frame changed the ring to %v", got)
+	}
+}
+
+func TestReleasesWhenFirmwareGoesDarkAndRestoresItsFrame(t *testing.T) {
+	m := newMounter()
+	r := newTestRing(t, 6, config(300, 60000), m)
+	setLED(t, r, 0, alicePurple)
 	r.Route("a", "home")
-	eventually(t, "takeover", func() bool { return m.mounted() == 18 })
-	firmware(t, r, 0, [3]int{0x6b, 0x0f, 0xff})
-	eventually(t, "home color", func() bool { return ledValue(t, r, 0) == [3]int{0x18, 0xbc, 0xf2} })
+	eventually(t, "home color", func() bool { return ledValue(t, r, 0) == homeBlue })
 	firmware(t, r, 0, [3]int{})
 	eventually(t, "release", func() bool { return m.mounted() == 0 })
 	if got := ledValue(t, r, 0); got != ([3]int{}) {
@@ -207,40 +286,74 @@ func TestReleasesWhenFirmwareGoesDark(t *testing.T) {
 	}
 }
 
-func TestUncoloredRouteReleasesTakeover(t *testing.T) {
-	m := &fakeMounter{bound: map[string]bool{}}
-	r := newTestRing(t, 6, config(10000, 60000), m)
+func TestReleaseRestoresStaticFirmwareFrame(t *testing.T) {
+	m := newMounter()
+	r := newTestRing(t, 1, config(10000, 60000), m)
+	setLED(t, r, 0, alicePurple)
 	r.Route("a", "llm")
-	eventually(t, "takeover", func() bool { return m.mounted() == 18 })
+	eventually(t, "recolor", func() bool { return ledValue(t, r, 0) == claude })
 	r.Route("b", "yandex")
 	eventually(t, "release", func() bool { return m.mounted() == 0 })
+	if got := ledValue(t, r, 0); got != alicePurple {
+		t.Fatalf("ring after release = %v, want the firmware's own %v", got, alicePurple)
+	}
+}
+
+func TestNewRequestHandsRingBack(t *testing.T) {
+	m := newMounter()
+	r := newTestRing(t, 6, config(10000, 60000), m)
+	setLED(t, r, 0, alicePurple)
+	r.Route("a", "llm")
+	eventually(t, "takeover", func() bool { return m.mounted() == 18 })
+	r.Start("b")
+	eventually(t, "release on new request", func() bool { return m.mounted() == 0 })
+}
+
+func TestColorChangeKeepsTakeoverAndReleaseAllowsNext(t *testing.T) {
+	m := newMounter()
+	r := newTestRing(t, 6, config(10000, 60000), m)
+	setLED(t, r, 0, alicePurple)
+	r.Route("a", "llm")
+	eventually(t, "claude", func() bool { return ledValue(t, r, 0) == claude })
+	r.Route("b", "home")
+	eventually(t, "home", func() bool { return ledValue(t, r, 0) == homeBlue })
+	if m.bindCount() != 18 {
+		t.Fatalf("binds = %d; a color change must not mount again", m.bindCount())
+	}
+	r.Route("c", "yandex")
+	eventually(t, "release", func() bool { return m.mounted() == 0 })
+	r.Route("d", "llm")
+	eventually(t, "second takeover", func() bool { return m.mounted() == 18 && m.bindCount() == 36 })
 }
 
 func TestUncoloredRouteWhileIdleLeavesRingAlone(t *testing.T) {
-	m := &fakeMounter{bound: map[string]bool{}}
+	m := newMounter()
 	r := newTestRing(t, 6, config(600, 60000), m)
-	if err := os.WriteFile(r.zones[0][2].path, []byte("200\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	setLED(t, r, 0, [3]int{0, 0, 200})
 	r.Route("a", "yandex")
 	r.Route("b", "playback")
+	r.Start("c")
 	time.Sleep(100 * time.Millisecond)
-	if m.binds != 0 || ledValue(t, r, 0)[2] != 200 {
-		t.Fatalf("binds = %d, ring = %v; firmware colors must stay untouched", m.binds, ledValue(t, r, 0))
+	if m.bindCount() != 0 || ledValue(t, r, 0) != [3]int{0, 0, 200} {
+		t.Fatalf("binds = %d, ring = %v; firmware colors must stay untouched", m.bindCount(), ledValue(t, r, 0))
 	}
 }
 
-func TestMaxEndsTakeoverEvenWhileLit(t *testing.T) {
-	m := &fakeMounter{bound: map[string]bool{}}
-	r := newTestRing(t, 2, config(10000, 1000), m)
+func TestLitRingOutlivesIdleUntilMax(t *testing.T) {
+	m := newMounter()
+	r := newTestRing(t, 1, config(300, 1000), m)
+	setLED(t, r, 0, alicePurple)
 	r.Route("a", "llm")
-	eventually(t, "takeover", func() bool { return m.mounted() == 6 })
-	firmware(t, r, 0, [3]int{0x6b, 0x0f, 0xff})
+	eventually(t, "takeover", func() bool { return m.mounted() == 3 })
+	time.Sleep(600 * time.Millisecond)
+	if m.mounted() != 3 {
+		t.Fatal("a lit ring was released by idle_ms")
+	}
 	eventually(t, "release by max_ms", func() bool { return m.mounted() == 0 })
 }
 
 func TestOffReleasesSynchronously(t *testing.T) {
-	m := &fakeMounter{bound: map[string]bool{}}
+	m := newMounter()
 	r := newTestRing(t, 6, config(10000, 60000), m)
 	r.Route("a", "llm")
 	eventually(t, "takeover", func() bool { return m.mounted() == 18 })
@@ -249,13 +362,15 @@ func TestOffReleasesSynchronously(t *testing.T) {
 		t.Fatalf("%d stand-ins still mounted after Off", m.mounted())
 	}
 	r.Route("b", "llm")
+	r.Off()
 }
 
 func TestFailedTakeoverRollsBack(t *testing.T) {
-	m := &fakeMounter{bound: map[string]bool{}, failAt: 5}
+	m := newMounter()
+	m.failAt = 5
 	r := newTestRing(t, 6, config(600, 60000), m)
 	r.Route("a", "llm")
-	eventually(t, "attempt", func() bool { m.mu.Lock(); defer m.mu.Unlock(); return m.binds >= 5 })
+	eventually(t, "attempt", func() bool { return m.bindCount() >= 5 })
 	time.Sleep(50 * time.Millisecond)
 	if m.mounted() != 0 {
 		t.Fatalf("%d stand-ins left after failed takeover", m.mounted())
@@ -265,6 +380,7 @@ func TestFailedTakeoverRollsBack(t *testing.T) {
 func TestNilRingIsInert(t *testing.T) {
 	var r *Ring
 	r.Route("a", "llm")
+	r.Start("b")
 	r.Off()
 	if r.Zones() != 0 {
 		t.Fatal("nil ring reports zones")

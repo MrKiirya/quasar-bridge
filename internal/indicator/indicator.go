@@ -3,8 +3,8 @@
 // The firmware draws its animations by opening each sysfs brightness file per frame. While a colored
 // route is active, the ring's brightness files are covered by bind-mounted tmpfs stand-ins: the firmware
 // keeps animating into them, and the indicator copies every frame to the real LEDs in the route color,
-// keeping the firmware's brightness and timing. When the firmware animation ends or an uncolored route
-// arrives, the stand-ins are unmounted and the firmware drives the ring again.
+// keeping the firmware's brightness and timing. When the firmware animation ends, a new request starts
+// or an uncolored route arrives, the stand-ins are unmounted and the firmware drives the ring again.
 package indicator
 
 import (
@@ -27,6 +27,8 @@ const (
 	// DefaultStandIns must be on tmpfs: the firmware writes there on every animation frame.
 	DefaultStandIns = "/tmp/quasar-bridge-ring"
 	frame           = 20 * time.Millisecond
+	// Stacked stand-ins from crashed runs are peeled one mount at a time.
+	maxStacked = 8
 )
 
 type Config struct {
@@ -64,15 +66,19 @@ func (c Config) Validate() error {
 
 type mounter interface {
 	Bind(source, target string) error
+	// Unbind detaches the top mount at target; it fails when nothing is mounted there.
 	Unbind(target string) error
+	// Real rejects a handle that does not point at a real LED, e.g. a stand-in that is still mounted.
+	Real(f *os.File) error
 }
 
-// channel is one LED brightness file, its stand-in and an fd opened before any stand-in covers it.
+// channel is one LED brightness file, its stand-in and handles opened before any stand-in covers it.
 type channel struct {
 	path, standIn string
 	real          *os.File
-	level         int // last level read from the stand-in
-	written       int // last value written to the real LED, -1 when unknown
+	in            *os.File // the stand-in, open during a takeover
+	raw           int      // last value the firmware wrote to the stand-in
+	written       int      // last value written to the real LED, -1 when unknown
 }
 
 type Ring struct {
@@ -91,6 +97,25 @@ type Ring struct {
 }
 
 var redRing = regexp.MustCompile(`^(.+):red:ring([0-9]+)$`)
+
+// Cleanup unmounts stand-ins left over a ring under root by a run that was killed mid-takeover.
+// It runs whether or not the indicator is enabled, so turning it off also repairs a frozen ring.
+func Cleanup(root string) { cleanup(root, sysMounter{}) }
+
+func cleanup(root string, m mounter) {
+	files, _ := filepath.Glob(filepath.Join(root, "*:ring*", "brightness"))
+	for _, path := range files {
+		peel(path, m)
+	}
+}
+
+func peel(path string, m mounter) {
+	for range maxStacked {
+		if m.Unbind(path) != nil {
+			return
+		}
+	}
+}
 
 // New returns nil when the indicator is disabled or the host has no RGB ring under root.
 func New(cfg Config, root, standIns string) (*Ring, error) {
@@ -125,7 +150,11 @@ func newRing(cfg Config, root, standIns string, m mounter) (*Ring, error) {
 		return nil, nil
 	}
 	slices.SortFunc(zones, func(a, b found) int { return a.index - b.index })
+	// The YAM launcher runs with umask 077; the firmware must still be able to open the stand-ins.
 	if err := os.MkdirAll(standIns, 0o755); err != nil {
+		return nil, err
+	}
+	if err := os.Chmod(standIns, 0o755); err != nil {
 		return nil, err
 	}
 	r := &Ring{colors: map[string][3]int{}, idle: time.Duration(cfg.IdleMS) * time.Millisecond, max: time.Duration(cfg.MaxMS) * time.Millisecond, mount: m, signal: make(chan struct{}, 1), done: make(chan struct{}), exited: make(chan struct{})}
@@ -138,12 +167,17 @@ func newRing(cfg Config, root, standIns string, m mounter) (*Ring, error) {
 	for _, z := range zones {
 		var zone [3]*channel
 		for i, path := range z.paths {
-			// A crashed run can leave a stand-in mounted; the real file must be reachable before opening it.
-			_ = m.Unbind(path)
-			f, err := os.OpenFile(path, os.O_WRONLY, 0)
+			peel(path, m)
+			f, err := os.OpenFile(path, os.O_RDWR, 0)
+			if err == nil {
+				err = m.Real(f)
+				if err != nil {
+					f.Close()
+				}
+			}
 			if err != nil {
 				r.closeFiles()
-				return nil, err
+				return nil, fmt.Errorf("%s: %w", path, err)
 			}
 			zone[i] = &channel{path: path, standIn: filepath.Join(standIns, strings.ReplaceAll(filepath.Base(filepath.Dir(path)), ":", "_")), real: f, written: -1}
 		}
@@ -179,6 +213,9 @@ func (r *Ring) Route(_, route string) {
 	default:
 	}
 }
+
+// Start matches bridge.Native.OnStart: a new request hands the ring back until its own route is known.
+func (r *Ring) Start(id string) { r.Route(id, "") }
 
 // Off unmounts any stand-ins and stops the indicator, so a stopping bridge leaves the ring to the firmware.
 func (r *Ring) Off() {
@@ -250,23 +287,32 @@ func (r *Ring) run() {
 	}
 }
 
-// takeover covers every ring brightness file with a stand-in that starts at the current value.
+// takeover covers every ring brightness file with a stand-in that starts at the firmware's current value.
 func (r *Ring) takeover() error {
 	var bound []*channel
+	undo := func(err error) error {
+		for _, b := range bound {
+			r.unbind(b)
+		}
+		return err
+	}
 	for _, z := range r.zones {
 		for _, c := range z {
-			value, _ := os.ReadFile(c.path)
-			err := os.WriteFile(c.standIn, value, 0o644)
+			c.raw = readValue(c.real, 0)
+			err := os.WriteFile(c.standIn, []byte(strconv.Itoa(c.raw)), 0o644)
 			if err == nil {
-				err = r.mount.Bind(c.standIn, c.path)
+				err = os.Chmod(c.standIn, 0o644)
+			}
+			if err == nil {
+				c.in, err = os.Open(c.standIn)
 			}
 			if err != nil {
-				for _, b := range bound {
-					_ = r.mount.Unbind(b.path)
-				}
-				return err
+				return undo(err)
 			}
-			c.level, _ = readLevel(c.standIn)
+			if err := r.mount.Bind(c.standIn, c.path); err != nil {
+				c.in.Close()
+				return undo(err)
+			}
 			c.written = -1
 			bound = append(bound, c)
 		}
@@ -274,13 +320,27 @@ func (r *Ring) takeover() error {
 	return nil
 }
 
+// release hands the ring back and restores the firmware's own last frame,
+// in case the firmware holds a static pattern instead of redrawing it.
 func (r *Ring) release() {
 	for _, z := range r.zones {
 		for _, c := range z {
-			if err := r.mount.Unbind(c.path); err != nil {
-				slog.Warn("route_indicator_release_failed", "path", c.path, "error", err)
+			r.unbind(c)
+			if _, err := c.real.WriteAt(fmt.Appendf(nil, "%03d\n", c.raw), 0); err == nil {
+				c.written = c.raw
 			}
 		}
+	}
+}
+
+func (r *Ring) unbind(c *channel) {
+	// Detaching cannot fail with EBUSY while the firmware has the file open for a frame.
+	if err := r.mount.Unbind(c.path); err != nil {
+		slog.Warn("route_indicator_release_failed", "path", c.path, "error", err)
+	}
+	if c.in != nil {
+		c.in.Close()
+		c.in = nil
 	}
 }
 
@@ -290,11 +350,9 @@ func (r *Ring) mirror(color [3]int) bool {
 	for _, z := range r.zones {
 		level := 0
 		for _, c := range z {
-			// The firmware truncates before writing; an empty read keeps the previous level.
-			if v, ok := readLevel(c.standIn); ok {
-				c.level = v
-			}
-			level = max(level, c.level)
+			// The firmware truncates before writing; an empty read keeps the previous value.
+			c.raw = readValue(c.in, c.raw)
+			level = max(level, c.raw)
 		}
 		lit = lit || level > 0
 		for i, c := range z {
@@ -302,7 +360,7 @@ func (r *Ring) mirror(color [3]int) bool {
 			if v == c.written {
 				continue
 			}
-			// Zero padding keeps the value parseable whatever was in the file before; sysfs ignores it.
+			// sysfs accepts leading zeros; the fixed width also keeps regular files in tests parseable.
 			if _, err := c.real.WriteAt(fmt.Appendf(nil, "%03d\n", v), 0); err == nil {
 				c.written = v
 			}
@@ -311,14 +369,16 @@ func (r *Ring) mirror(color [3]int) bool {
 	return lit
 }
 
-func readLevel(path string) (int, bool) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return 0, false
+// readValue reads a brightness value through an open handle, keeping previous when the read is empty or invalid.
+func readValue(f *os.File, previous int) int {
+	if f == nil {
+		return previous
 	}
-	v, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	var buf [16]byte
+	n, _ := f.ReadAt(buf[:], 0)
+	v, err := strconv.Atoi(strings.TrimSpace(string(buf[:n])))
 	if err != nil {
-		return 0, false
+		return previous
 	}
-	return min(max(v, 0), 255), true
+	return min(max(v, 0), 255)
 }
