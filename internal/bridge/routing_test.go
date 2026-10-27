@@ -245,8 +245,64 @@ func TestSpeakerPlaybackControlSkipsClassifier(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, text := range []string{"Объясни слово хватит", "Не останавливай музыку", "Хватит ли памяти для модели", "Поставь таймер на паузу", "Включи свет", "Поставь музыку с сайта audio.example/music"} {
-		if d, ok := p.match(text); ok && d.Rule == "speaker_playback" {
+		if d, ok := p.match(text, ""); ok && d.Rule == "speaker_playback" {
 			t.Errorf("false speaker control: %q", text)
 		}
+	}
+}
+
+func TestRoutingWakeWordAny(t *testing.T) {
+	cfg := DefaultRoutingConfig()
+	cfg.Rules = []RoutingRule{
+		{Name: "comrade", Route: "llm", Match: RoutingMatch{WakeWordAny: []string{"Товарищ"}}},
+		{Name: "comrade-home", Route: "home", Match: RoutingMatch{WakeWordAny: []string{"джарвис"}, ContainsAny: []string{"свет"}}},
+	}
+	cfg.DefaultRoute = "yandex"
+	e := &Engine{Home: homeFunc(func(context.Context, string) (string, error) { return "", nil })}
+	if err := e.SetRouting(cfg); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct{ wake, text, route, rule string }{
+		{"", "как дела", "yandex", ""},
+		{"товарищ", "как дела", "llm", "comrade"},
+		{"джарвис", "включи свет", "home", "comrade-home"},
+		{"джарвис", "как дела", "yandex", ""},
+	} {
+		ctx := t.Context()
+		if tc.wake != "" {
+			ctx = WithWakeWord(ctx, tc.wake)
+		}
+		if got := e.Decide(ctx, tc.text); got.Route != tc.route || got.Rule != tc.rule {
+			t.Errorf("%q/%q: %+v", tc.wake, tc.text, got)
+		}
+	}
+	cfg.Rules = []RoutingRule{{Name: "empty", Route: "llm", Match: RoutingMatch{WakeWordAny: []string{" "}}}}
+	if _, err := CompileRouting(cfg); err == nil {
+		t.Fatal("empty wake word accepted")
+	}
+}
+
+func TestEngineUsesWakeWordFollowsActiveRules(t *testing.T) {
+	cfg := DefaultRoutingConfig()
+	e := new(Engine)
+	if err := e.SetRouting(cfg); err != nil {
+		t.Fatal(err)
+	}
+	if e.UsesWakeWord() {
+		t.Fatal("default rules use the wake word")
+	}
+	cfg.Rules = append(cfg.Rules, RoutingRule{Name: "comrade", Route: "llm", Disabled: true, Match: RoutingMatch{WakeWordAny: []string{"товарищ"}}})
+	if err := e.SetRouting(cfg); err != nil {
+		t.Fatal(err)
+	}
+	if e.UsesWakeWord() {
+		t.Fatal("disabled rule counted")
+	}
+	cfg.Rules[len(cfg.Rules)-1].Disabled = false
+	if err := e.SetRouting(cfg); err != nil {
+		t.Fatal(err)
+	}
+	if !e.UsesWakeWord() {
+		t.Fatal("active rule not counted")
 	}
 }

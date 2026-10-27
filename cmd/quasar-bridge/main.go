@@ -26,6 +26,7 @@ import (
 	"quasarbridge/internal/indicator"
 	"quasarbridge/internal/journal"
 	"quasarbridge/internal/llm"
+	"quasarbridge/internal/wakeword"
 	"quasarbridge/internal/wire"
 )
 
@@ -35,6 +36,7 @@ func main() {
 	check := flag.Bool("check-backends", false, "check LLM and configured Home Assistant connectivity")
 	checkMCP := flag.Bool("check-mcp", false, "connect to configured MCP servers and list tools without executing them")
 	route := flag.String("route", "", "explain a route without executing home actions or generating an answer")
+	routeWake := flag.String("wake-word", "", "with -route: the custom wake word that opened the request")
 	validate := flag.Bool("check-config", false, "validate configuration without contacting backends")
 	speakerAction := flag.String("speaker-endpoint", "", "apply or rollback the on-device loopback endpoint (requires writable firmware)")
 	speakerConfig := flag.String("speaker-config", "/system/vendor/quasar/quasar.cfg", "firmware configuration path")
@@ -195,6 +197,9 @@ func main() {
 		ctx, cancel := context.WithTimeout(context.Background(), 75*time.Second)
 		defer cancel()
 		if *route != "" {
+			if *routeWake != "" {
+				ctx = bridge.WithWakeWord(ctx, *routeWake)
+			}
 			data, _ := json.Marshal(engine.Decide(ctx, *route))
 			fmt.Println(string(data))
 			return
@@ -251,6 +256,10 @@ func main() {
 			}()
 		}
 
+		var wake *wakeword.Client
+		if cfg.WakeWord.Enabled {
+			wake = wakeword.New(cfg.WakeWord)
+		}
 		proxy.NewSession = func(ctx context.Context, up, down bridge.Sender) bridge.Session {
 			n := bridge.NewNative(ctx, up, down, engine)
 			n.GateText = false
@@ -258,6 +267,9 @@ func main() {
 			if cfg.LocalProgress.Enabled {
 				n.ProgressAfter = time.Duration(cfg.LocalProgress.AfterMS) * time.Millisecond
 				n.ProgressInterval = time.Duration(cfg.LocalProgress.IntervalMS) * time.Millisecond
+			}
+			if wake != nil {
+				n.WakeWord = wake.Word
 			}
 
 			return n
@@ -298,7 +310,7 @@ func main() {
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		state := engine.RoutingStatus()
-		data, _ := json.Marshal(map[string]any{"status": "ok", "mode": cfg.Mode, "client_frames": clientCount.Load(), "server_frames": serverCount.Load(), "routing_revision": state.Revision, "routing_rules": state.ActiveRules, "conversation_log_enabled": logs.Enabled(), "conversation_log_failures": logs.Failures(), "assistant_tools_enabled": cfg.AssistantTools.Enabled, "dialogue_context_enabled": cfg.DialogueContext.Enabled && cfg.Mode == "hybrid", "home_assistant_enabled": hc != nil && cfg.Mode == "hybrid", "mcp_servers_configured": mcpConfigured, "music_playback_enabled": musicQueue != nil, "route_indicator_enabled": ring != nil})
+		data, _ := json.Marshal(map[string]any{"status": "ok", "mode": cfg.Mode, "client_frames": clientCount.Load(), "server_frames": serverCount.Load(), "routing_revision": state.Revision, "routing_rules": state.ActiveRules, "conversation_log_enabled": logs.Enabled(), "conversation_log_failures": logs.Failures(), "assistant_tools_enabled": cfg.AssistantTools.Enabled, "dialogue_context_enabled": cfg.DialogueContext.Enabled && cfg.Mode == "hybrid", "home_assistant_enabled": hc != nil && cfg.Mode == "hybrid", "mcp_servers_configured": mcpConfigured, "music_playback_enabled": musicQueue != nil, "route_indicator_enabled": ring != nil, "wake_word_enabled": cfg.WakeWord.Enabled && cfg.Mode == "hybrid"})
 		_, _ = w.Write(data)
 	})
 	mux.Handle("/uni.ws", proxy)

@@ -570,3 +570,67 @@ func TestNativeReportsRequestStartBeforeRoute(t *testing.T) {
 		}
 	}
 }
+
+type wakeResolver struct {
+	uses bool
+	got  chan string
+}
+
+func (r wakeResolver) Resolve(ctx context.Context, _ string) (Resolution, error) {
+	r.got <- WakeWord(ctx)
+	return Resolution{Route: "yandex"}, nil
+}
+func (r wakeResolver) UsesWakeWord() bool { return r.uses }
+
+func TestNativeWakeWordReachesResolverForVoiceOnly(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		voice      bool
+		uses       bool
+		want       string
+		wantLookup bool
+	}{
+		{"voice", true, true, "товарищ", true},
+		{"text", false, true, "", false},
+		{"no rule", true, false, "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+			defer cancel()
+			up := make(chan []byte, 16)
+			resolver := wakeResolver{uses: tc.uses, got: make(chan string, 1)}
+			n := NewNative(ctx, func(_ context.Context, _ websocket.MessageType, b []byte) error { up <- b; return nil }, func(context.Context, websocket.MessageType, []byte) error { return nil }, resolver)
+			defer n.Close()
+			var asked time.Time
+			n.WakeWord = func(_ context.Context, at time.Time) string { asked = at; return "  Товарищ " }
+			journaled := make(chan string, 1)
+			n.OnWakeWord = func(_, word string) { journaled <- word }
+			if tc.voice {
+				voice := aa(&client.TClientMessage{Message: &client.TClientMessage_Event{Event: &client.TClientMessage_TEvent{Header: &header.TEventHeader{MessageId: "voice", StreamId: new(int64(1))}, Event: &client.TClientMessage_TEvent_VoiceInput{VoiceInput: &request.TAliceRequestProto{Request: &request.TAliceRequestProto_TRequest{Event: &common.TEvent{Type: common.EEventType_voice_input.Enum()}}, Format: new("audio/opus")}}}}})
+				_ = n.Client(ctx, websocket.MessageBinary, voice)
+				<-up
+				result := aa(&server.TServerMessage{Message: &server.TServerMessage_Event{Event: &server.TServerMessage_TEvent{Header: &header.TEventHeader{RefMessageId: "voice"}, Event: &server.TServerMessage_TEvent_AsrResult{AsrResult: &asr.TAsrResult{EndOfUtt: new(true), Recognition: []*recognition.TAsrRecognition{{Normalized: new("как дела")}}}}}}})
+				_ = n.Server(ctx, websocket.MessageBinary, result)
+			} else {
+				text := aa(&client.TClientMessage{Message: &client.TClientMessage_Event{Event: &client.TClientMessage_TEvent{Header: &header.TEventHeader{MessageId: "text"}, Event: &client.TClientMessage_TEvent_TextInput{TextInput: &request.TAliceRequestProto{Request: &request.TAliceRequestProto_TRequest{Event: &common.TEvent{Type: common.EEventType_text_input.Enum(), Text: new("как дела")}}}}}}})
+				_ = n.Client(ctx, websocket.MessageBinary, text)
+			}
+			select {
+			case w := <-resolver.got:
+				if w != tc.want {
+					t.Fatalf("wake word %q, want %q", w, tc.want)
+				}
+				if asked.IsZero() == tc.wantLookup {
+					t.Fatalf("lookup called = %v, want %v", !asked.IsZero(), tc.wantLookup)
+				}
+			case <-ctx.Done():
+				t.Fatal("no decision")
+			}
+			if tc.want != "" {
+				if w := <-journaled; w != tc.want {
+					t.Fatalf("journaled %q", w)
+				}
+			}
+		})
+	}
+}

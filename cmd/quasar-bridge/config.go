@@ -16,6 +16,7 @@ import (
 	"quasarbridge/internal/indicator"
 	"quasarbridge/internal/journal"
 	"quasarbridge/internal/llm"
+	"quasarbridge/internal/wakeword"
 )
 
 type progressConfig struct {
@@ -47,10 +48,11 @@ type config struct {
 	Routing            bridge.RoutingConfig `json:"routing"`
 	Prompts            bridge.PromptFiles   `json:"prompts"`
 	RouteIndicator     indicator.Config     `json:"route_indicator"`
+	WakeWord           wakeword.Config      `json:"wake_word"`
 }
 
 func readConfig(path string) (config, error) {
-	cfg := config{DialogueContext: dialogue.DefaultConfig(), Routing: bridge.DefaultRoutingConfig(), ConversationLog: journal.DefaultConfig(), AssistantTools: assistant.DefaultConfig(), LocalProgress: progressConfig{AfterMS: 2000, IntervalMS: 4000}, LLMAPI: "chat_completions", LLMMaxOutputTokens: 4096, ListenAfterReply: true, RouteIndicator: indicator.DefaultConfig()}
+	cfg := config{DialogueContext: dialogue.DefaultConfig(), Routing: bridge.DefaultRoutingConfig(), ConversationLog: journal.DefaultConfig(), AssistantTools: assistant.DefaultConfig(), LocalProgress: progressConfig{AfterMS: 2000, IntervalMS: 4000}, LLMAPI: "chat_completions", LLMMaxOutputTokens: 4096, ListenAfterReply: true, RouteIndicator: indicator.DefaultConfig(), WakeWord: wakeword.DefaultConfig()}
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return cfg, errors.New("cannot read configuration file")
@@ -174,6 +176,9 @@ func readConfig(path string) (config, error) {
 		return cfg, err
 	}
 	if err := cfg.RouteIndicator.Validate(); err != nil {
+		return cfg, err
+	}
+	if err := cfg.WakeWord.Validate(); err != nil {
 		return cfg, err
 	}
 	if _, err := bridge.CompileRouting(cfg.Routing); err != nil {

@@ -64,6 +64,9 @@ func (c *conversation) route(id, route string) {
 	c.mu.Unlock()
 	c.emit(id, journal.Event{Event: "route"})
 }
+func (c *conversation) wakeWord(id, word string) {
+	c.emit(id, journal.Event{Event: "wake_word", Text: word})
+}
 func (c *conversation) client(data []byte) {
 	if !c.writer.Enabled() {
 		return

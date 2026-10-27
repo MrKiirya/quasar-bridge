@@ -1,12 +1,14 @@
 package bridge
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"quasarbridge/internal/dialogue"
 	"regexp"
+	"slices"
 	"strings"
 )
 
@@ -27,6 +29,7 @@ type RoutingMatch struct {
 	ContainsAllGroups [][]string `json:"contains_all_groups,omitempty"`
 	ContainsNone      []string   `json:"contains_none,omitempty"`
 	StartsWithAny     []string   `json:"starts_with_any,omitempty"`
+	WakeWordAny       []string   `json:"wake_word_any,omitempty"`
 	Regex             string     `json:"regex,omitempty"`
 }
 type ClassifierConfig struct {
@@ -49,6 +52,7 @@ type RouteDecision struct {
 type compiledRule struct {
 	name, route       string
 	any, none, prefix []string
+	wake              []string
 	groups            [][]string
 	regex             *regexp.Regexp
 }
@@ -61,6 +65,7 @@ type RoutingPolicy struct {
 	classifier                      ClassifierConfig
 	refusalEnabled                  bool
 	refusalPrefixes, refusalPhrases []string
+	wakeWord                        bool
 	revision                        string
 }
 
@@ -91,6 +96,18 @@ func DefaultRoutingConfig() RoutingConfig {
 		Refusal:      RefusalConfig{Enabled: true, Prefixes: []string{"не могу", "я не могу", "я не буду", "не буду", "не поняла", "я не поняла", "не понял", "я не понял", "извините", "простите", "к сожалению", "не знаю", "я не знаю", "я пока не умею", "пока не умею", "увы"}, ContainsAny: []string{"не могу помочь", "не могу обсуждать", "не могу выполнить", "не могу понять", "не могу ответить", "не буду отвечать", "не поняла", "не понял", "не понимаю", "не удалось понять", "не знаю", "не умею", "не отвечу"}},
 	}
 }
+
+type wakeWordKey struct{}
+
+// WithWakeWord records the custom wake word that opened a voice request,
+// folded like wake_word_any terms.
+func WithWakeWord(ctx context.Context, word string) context.Context {
+	return context.WithValue(ctx, wakeWordKey{}, strings.Join(strings.Fields(strings.ToLower(word)), " "))
+}
+
+// WakeWord returns the custom wake word of the request, "" for the stock one.
+func WakeWord(ctx context.Context) string { s, _ := ctx.Value(wakeWordKey{}).(string); return s }
+
 func directRoute(route string) bool { return route == "home" || route == "llm" || route == "yandex" }
 func foldTerms(terms []string, refusal bool) ([]string, error) {
 	out := make([]string, len(terms))
@@ -130,7 +147,7 @@ func CompileRouting(cfg RoutingConfig) (*RoutingPolicy, error) {
 			return fail("invalid route")
 		}
 		m := rule.Match
-		if len(m.ContainsAny) == 0 && len(m.ContainsAllGroups) == 0 && len(m.StartsWithAny) == 0 && m.Regex == "" {
+		if len(m.ContainsAny) == 0 && len(m.ContainsAllGroups) == 0 && len(m.StartsWithAny) == 0 && len(m.WakeWordAny) == 0 && m.Regex == "" {
 			return fail("at least one positive condition is required")
 		}
 		r := compiledRule{name: rule.Name, route: rule.Route}
@@ -143,6 +160,9 @@ func CompileRouting(cfg RoutingConfig) (*RoutingPolicy, error) {
 		}
 		if r.prefix, err = foldTerms(m.StartsWithAny, false); err != nil {
 			return fail("starts_with_any has an empty term")
+		}
+		if r.wake, err = foldTerms(m.WakeWordAny, true); err != nil {
+			return fail("wake_word_any has an empty term")
 		}
 		for _, group := range m.ContainsAllGroups {
 			if len(group) == 0 {
@@ -162,6 +182,7 @@ func CompileRouting(cfg RoutingConfig) (*RoutingPolicy, error) {
 		}
 		if !rule.Disabled {
 			p.rules = append(p.rules, r)
+			p.wakeWord = p.wakeWord || len(r.wake) > 0
 		}
 	}
 	var err error
@@ -182,9 +203,12 @@ func CompileRouting(cfg RoutingConfig) (*RoutingPolicy, error) {
 	p.revision = fmt.Sprintf("%x", hash[:8])
 	return p, nil
 }
-func (p *RoutingPolicy) match(text string) (RouteDecision, bool) {
+func (p *RoutingPolicy) match(text, wake string) (RouteDecision, bool) {
 	lower := strings.ToLower(text)
 	for _, r := range p.rules {
+		if len(r.wake) > 0 && !slices.Contains(r.wake, wake) {
+			continue
+		}
 		if len(r.any) > 0 && !containsOne(lower, r.any) {
 			continue
 		}

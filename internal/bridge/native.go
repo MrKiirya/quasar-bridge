@@ -74,6 +74,7 @@ type nativeRequest struct {
 	soundDirective                  *soundDirective
 	soundSealed                     bool
 	expires                         *time.Timer
+	wake                            chan string
 }
 type Native struct {
 	connectionScope  string
@@ -94,6 +95,16 @@ type Native struct {
 	DecisionDelay    time.Duration
 	ProgressAfter    time.Duration
 	ProgressInterval time.Duration
+	// WakeWord names the custom wake word that opened a voice request received at the given time, "" for the stock one.
+	WakeWord func(context.Context, time.Time) string
+	// OnWakeWord is told the custom wake word of a native request, after the journal.
+	OnWakeWord func(id, word string)
+}
+
+// usesWakeWord reports whether the resolver's current rules read the wake word.
+func usesWakeWord(r Resolver) bool {
+	u, ok := r.(interface{ UsesWakeWord() bool })
+	return ok && u.UsesWakeWord()
 }
 
 func NewNative(ctx context.Context, up, down Sender, resolver Resolver) *Native {
@@ -167,6 +178,10 @@ func (n *Native) Client(ctx context.Context, k websocket.MessageType, data []byt
 		p.isText = f.Kind() == "TextInput"
 		p.input = append([]byte{}, data...)
 		p.gated = !p.isText || n.GateText
+		received := time.Now()
+		if !p.isText && n.WakeWord != nil && usesWakeWord(n.resolver) {
+			p.wake = make(chan string, 1)
+		}
 
 		slog.Info("native_request_shape", "request", requestTag(id), "text_bytes", len(p.text), "event_type", req.GetRequest().GetEvent().GetType().String(), "stream", e.GetHeader().GetStreamId(), "unknown_request_bytes", len(req.ProtoReflect().GetUnknown()), "payload_bytes", len(req.GetRequest().GetEvent().GetPayloadRaw()))
 		n.mu.Lock()
@@ -209,6 +224,10 @@ func (n *Native) Client(ctx context.Context, k websocket.MessageType, data []byt
 			n.OnStart(id)
 		}
 		n.mu.Unlock()
+		if p.wake != nil {
+			// Ask now, while the request is still being recognized.
+			n.wg.Go(func() { p.wake <- n.WakeWord(pctx, received) })
+		}
 		if p.gated {
 			gated, err := wire.EnableApproval(f)
 			if err != nil {
@@ -522,8 +541,23 @@ func (n *Native) maybeResolve(p *nativeRequest) {
 	}
 	p.started = true
 	text := p.text
+	ctx := p.ctx
 	n.mu.Unlock()
 	n.wg.Go(func() {
+		if p.wake != nil {
+			select {
+			case word := <-p.wake:
+				if word != "" {
+					ctx = WithWakeWord(ctx, word)
+					slog.Info("native_wake_word", "request", requestTag(p.id), "word", WakeWord(ctx))
+					if n.OnWakeWord != nil {
+						n.OnWakeWord(p.id, WakeWord(ctx))
+					}
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
 		if n.DecisionDelay > 0 {
 			select {
 			case <-time.After(n.DecisionDelay):
@@ -535,7 +569,7 @@ func (n *Native) maybeResolve(p *nativeRequest) {
 		var err error
 		if n.resolver != nil && strings.TrimSpace(text) != "" {
 			if routed, ok := n.resolver.(RoutedResolver); ok {
-				decision := routed.Decide(p.ctx, text)
+				decision := routed.Decide(ctx, text)
 				n.mu.Lock()
 				p.listenOnStreamStart = decision.Source == "dialogue_retry"
 				n.mu.Unlock()
@@ -544,10 +578,10 @@ func (n *Native) maybeResolve(p *nativeRequest) {
 				if decision.Route != "yandex" && n.ProgressAfter > 0 {
 					stop = n.progress(p)
 				}
-				result, err = routed.ResolveDecision(p.ctx, text, decision)
+				result, err = routed.ResolveDecision(ctx, text, decision)
 				stop()
 			} else {
-				result, err = n.resolver.Resolve(p.ctx, text)
+				result, err = n.resolver.Resolve(ctx, text)
 			}
 		}
 		if p.ctx.Err() != nil {
