@@ -14,6 +14,7 @@ import (
 	"quasarbridge/internal/bridge"
 	"quasarbridge/internal/chatgpt"
 	"quasarbridge/internal/dialogue"
+	"quasarbridge/internal/indicator"
 	"quasarbridge/internal/journal"
 	"quasarbridge/internal/llm"
 )
@@ -56,6 +57,7 @@ type config struct {
 	HomeWarmArea       string               `json:"home_warm_area"`
 	ListenAfterReply   bool                 `json:"listen_after_reply"`
 	Routing            bridge.RoutingConfig `json:"routing"`
+	RouteIndicator     indicator.Config     `json:"route_indicator"`
 }
 
 func readConfig(path string) (config, error) {
@@ -224,6 +226,9 @@ func parseConfig(raw []byte, modelOptional bool) (config, error) {
 	}
 	cfg.AirPlay.defaults()
 	if _, err := cfg.AirPlay.receiverConfig(); err != nil {
+		return cfg, err
+	}
+	if err := cfg.RouteIndicator.Validate(); err != nil {
 		return cfg, err
 	}
 	if _, err := bridge.CompileRouting(cfg.Routing); err != nil {

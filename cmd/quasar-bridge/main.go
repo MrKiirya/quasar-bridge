@@ -25,6 +25,7 @@ import (
 	"quasarbridge/internal/bridge"
 	"quasarbridge/internal/dialogue"
 	"quasarbridge/internal/home"
+	"quasarbridge/internal/indicator"
 	"quasarbridge/internal/journal"
 	"quasarbridge/internal/llm"
 	"quasarbridge/internal/update"
@@ -374,6 +375,26 @@ func main() {
 			return n
 		}
 	}
+	// A run killed mid-takeover leaves the ring frozen; repair it even when the indicator is off.
+	indicator.Cleanup(indicator.DefaultRoot)
+	// Routes are only reported by native hybrid sessions, so observe mode never recolors the ring.
+	var ring *indicator.Ring
+	switch {
+	case !cfg.RouteIndicator.Enabled:
+	case cfg.Mode != "hybrid":
+		slog.Warn("route_indicator_unavailable", "reason", "hybrid mode required")
+	default:
+		if ring, err = indicator.New(cfg.RouteIndicator, indicator.DefaultRoot, indicator.DefaultStandIns); err != nil {
+			slog.Warn("route_indicator_unavailable", "error", err)
+		} else if ring == nil {
+			slog.Warn("route_indicator_unavailable", "reason", "no RGB LED ring found")
+		} else {
+			proxy.OnRoute = ring.Route
+			proxy.OnStart = ring.Start
+			defer ring.Off()
+			slog.Info("route_indicator", "zones", ring.Zones())
+		}
+	}
 	mux := http.NewServeMux()
 	if musicQueue != nil {
 		mux.Handle("/music-stream/", musicQueue)
@@ -390,7 +411,7 @@ func main() {
 	var panel *diagnosticsListener
 	status := func() map[string]any {
 		state := engine.RoutingStatus()
-		return map[string]any{"status": "ok", "mode": cfg.Mode, "airplay": airPlayHealth(airPlay), "client_frames": clientCount.Load(), "server_frames": serverCount.Load(), "routing_revision": state.Revision, "routing_rules": state.ActiveRules, "routing_classifier_enabled": state.ClassifierEnabled, "routing_default_route": state.DefaultRoute, "conversation_log_enabled": logs.Enabled(), "conversation_log_failures": logs.Failures(), "assistant_tools_enabled": cfg.AssistantTools.Enabled, "dialogue_context_enabled": cfg.DialogueContext.Enabled && cfg.Mode == "hybrid", "home_assistant_enabled": hc != nil && cfg.Mode == "hybrid", "mcp_servers_configured": mcpConfigured, "music_playback_enabled": musicQueue != nil, "speaker_subscriptions": subscriptions.Snapshot()}
+		return map[string]any{"status": "ok", "mode": cfg.Mode, "airplay": airPlayHealth(airPlay), "client_frames": clientCount.Load(), "server_frames": serverCount.Load(), "routing_revision": state.Revision, "routing_rules": state.ActiveRules, "routing_classifier_enabled": state.ClassifierEnabled, "routing_default_route": state.DefaultRoute, "conversation_log_enabled": logs.Enabled(), "conversation_log_failures": logs.Failures(), "assistant_tools_enabled": cfg.AssistantTools.Enabled, "dialogue_context_enabled": cfg.DialogueContext.Enabled && cfg.Mode == "hybrid", "home_assistant_enabled": hc != nil && cfg.Mode == "hybrid", "mcp_servers_configured": mcpConfigured, "music_playback_enabled": musicQueue != nil, "speaker_subscriptions": subscriptions.Snapshot(), "route_indicator_enabled": ring != nil}
 	}
 	panelStatus := func() map[string]any {
 		result := status()

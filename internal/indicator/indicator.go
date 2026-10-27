@@ -1,0 +1,399 @@
+// Package indicator recolors the speaker's own LED ring animation to show the route of a voice request.
+//
+// The firmware draws its animations by opening each sysfs brightness file per frame. While a colored
+// route is active, the ring's brightness files are covered by bind-mounted tmpfs stand-ins: the firmware
+// keeps animating into them, and the indicator copies every frame to the real LEDs in the route color,
+// keeping the firmware's brightness and timing. When the firmware animation ends, a new request starts
+// or an uncolored route arrives, the stand-ins are unmounted and the firmware drives the ring again.
+package indicator
+
+import (
+	"errors"
+	"fmt"
+	"log/slog"
+	"math"
+	"os"
+	"path/filepath"
+	"regexp"
+	"slices"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+)
+
+const (
+	// DefaultRoot is where Linux exposes LED class devices.
+	DefaultRoot = "/sys/class/leds"
+	// DefaultStandIns must be on tmpfs: the firmware writes there on every animation frame.
+	DefaultStandIns = "/tmp/quasar-bridge-ring"
+	frame           = 20 * time.Millisecond
+	// Stacked stand-ins from crashed runs are peeled one mount at a time.
+	maxStacked = 8
+	// The firmware's Pro animations change hue more than brightness, so a recolored copy would look flat;
+	// a breathing wave on top keeps the ring alive while the firmware still decides when and where it is lit.
+	breathPeriod = 1600 * time.Millisecond
+	breathFloor  = 0.45
+)
+
+// breathe is the share of brightness a zone gets after elapsed: it swings between breathFloor and 1,
+// and neighbouring zones lag a little so the wave travels around the ring.
+func breathe(zone int, elapsed time.Duration) float64 {
+	phase := 2*math.Pi*float64(elapsed)/float64(breathPeriod) - float64(zone)*math.Pi/6
+	return breathFloor + (1-breathFloor)*(0.5+0.5*math.Sin(phase))
+}
+
+type Config struct {
+	Enabled bool `json:"enabled"`
+	// Colors maps a route to #rrggbb; an empty or missing color leaves the firmware's own colors.
+	Colors map[string]string `json:"colors"`
+	// IdleMS ends recoloring once the firmware has kept the ring dark this long.
+	IdleMS int `json:"idle_ms"`
+	// MaxMS caps one recoloring period, in case the firmware never darkens the ring.
+	MaxMS int `json:"max_ms"`
+}
+
+func DefaultConfig() Config {
+	return Config{Colors: map[string]string{"llm": "#d97757", "home": "#18bcf2", "music": "#00c8b4"}, IdleMS: 600, MaxMS: 60000}
+}
+
+var hexColor = regexp.MustCompile(`^#[0-9a-fA-F]{6}$`)
+
+func (c Config) Validate() error {
+	if c.IdleMS < 100 || c.IdleMS > 10000 || c.MaxMS < 1000 || c.MaxMS > 600000 {
+		return errors.New("invalid route_indicator idle_ms or max_ms")
+	}
+	for route, color := range c.Colors {
+		switch route {
+		case "yandex", "llm", "home", "music", "playback":
+		default:
+			return errors.New("invalid route_indicator route " + strconv.Quote(route))
+		}
+		if color != "" && !hexColor.MatchString(color) {
+			return errors.New("invalid route_indicator color for " + route)
+		}
+	}
+	return nil
+}
+
+type mounter interface {
+	Bind(source, target string) error
+	// Unbind detaches the top mount at target; it fails when nothing is mounted there.
+	Unbind(target string) error
+	// Real rejects a handle that does not point at a real LED, e.g. a stand-in that is still mounted.
+	Real(f *os.File) error
+}
+
+// channel is one LED brightness file, its stand-in and handles opened before any stand-in covers it.
+type channel struct {
+	path, standIn string
+	real          *os.File
+	in            *os.File // the stand-in, open during a takeover
+	raw           int      // last value the firmware wrote to the stand-in
+	written       int      // last value written to the real LED, -1 when unknown
+}
+
+type Ring struct {
+	zones  [][3]*channel
+	colors map[string][3]int
+	idle   time.Duration
+	max    time.Duration
+	mount  mounter
+	wave   func(zone int, elapsed time.Duration) float64
+
+	mu     sync.Mutex
+	route  string
+	signal chan struct{}
+	done   chan struct{}
+	exited chan struct{}
+	once   sync.Once
+}
+
+var redRing = regexp.MustCompile(`^(.+):red:ring([0-9]+)$`)
+
+// Cleanup unmounts stand-ins left over a ring under root by a run that was killed mid-takeover.
+// It runs whether or not the indicator is enabled, so turning it off also repairs a frozen ring.
+func Cleanup(root string) { cleanup(root, sysMounter{}) }
+
+func cleanup(root string, m mounter) {
+	files, _ := filepath.Glob(filepath.Join(root, "*:ring*", "brightness"))
+	for _, path := range files {
+		peel(path, m)
+	}
+}
+
+func peel(path string, m mounter) {
+	for range maxStacked {
+		if m.Unbind(path) != nil {
+			return
+		}
+	}
+}
+
+// New returns nil when the indicator is disabled or the host has no RGB ring under root.
+func New(cfg Config, root, standIns string) (*Ring, error) {
+	return newRing(cfg, root, standIns, sysMounter{}, breathe)
+}
+
+func newRing(cfg Config, root, standIns string, m mounter, wave func(int, time.Duration) float64) (*Ring, error) {
+	if !cfg.Enabled {
+		return nil, nil
+	}
+	type found struct {
+		index int
+		paths [3]string
+	}
+	var zones []found
+	matches, _ := filepath.Glob(filepath.Join(root, "*:red:ring*"))
+	for _, red := range matches {
+		match := redRing.FindStringSubmatch(filepath.Base(red))
+		if match == nil {
+			continue
+		}
+		index, _ := strconv.Atoi(match[2])
+		paths := [3]string{filepath.Join(red, "brightness")}
+		for i, c := range []string{"green", "blue"} {
+			paths[i+1] = filepath.Join(root, match[1]+":"+c+":ring"+match[2], "brightness")
+		}
+		if exists(paths[0]) && exists(paths[1]) && exists(paths[2]) {
+			zones = append(zones, found{index, paths})
+		}
+	}
+	if len(zones) == 0 {
+		return nil, nil
+	}
+	slices.SortFunc(zones, func(a, b found) int { return a.index - b.index })
+	// The YAM launcher runs with umask 077; the firmware must still be able to open the stand-ins.
+	if err := os.MkdirAll(standIns, 0o755); err != nil {
+		return nil, err
+	}
+	if err := os.Chmod(standIns, 0o755); err != nil {
+		return nil, err
+	}
+	r := &Ring{colors: map[string][3]int{}, idle: time.Duration(cfg.IdleMS) * time.Millisecond, max: time.Duration(cfg.MaxMS) * time.Millisecond, mount: m, wave: wave, signal: make(chan struct{}, 1), done: make(chan struct{}), exited: make(chan struct{})}
+	for route, color := range cfg.Colors {
+		if color != "" {
+			v, _ := strconv.ParseUint(color[1:], 16, 32)
+			r.colors[route] = [3]int{int(v >> 16 & 0xff), int(v >> 8 & 0xff), int(v & 0xff)}
+		}
+	}
+	for _, z := range zones {
+		var zone [3]*channel
+		for i, path := range z.paths {
+			peel(path, m)
+			f, err := os.OpenFile(path, os.O_RDWR, 0)
+			if err == nil {
+				err = m.Real(f)
+				if err != nil {
+					f.Close()
+				}
+			}
+			if err != nil {
+				r.closeFiles()
+				return nil, fmt.Errorf("%s: %w", path, err)
+			}
+			zone[i] = &channel{path: path, standIn: filepath.Join(standIns, strings.ReplaceAll(filepath.Base(filepath.Dir(path)), ":", "_")), real: f, written: -1}
+		}
+		r.zones = append(r.zones, zone)
+	}
+	go r.run()
+	return r, nil
+}
+
+func exists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+// Zones reports how many RGB zones were found.
+func (r *Ring) Zones() int {
+	if r == nil {
+		return 0
+	}
+	return len(r.zones)
+}
+
+// Route matches bridge.Native.OnRoute, which runs under the session lock: it only records the route.
+func (r *Ring) Route(_, route string) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	r.route = route
+	r.mu.Unlock()
+	select {
+	case r.signal <- struct{}{}:
+	default:
+	}
+}
+
+// Start matches bridge.Native.OnStart: a new request hands the ring back until its own route is known.
+func (r *Ring) Start(id string) { r.Route(id, "") }
+
+// Off unmounts any stand-ins and stops the indicator, so a stopping bridge leaves the ring to the firmware.
+func (r *Ring) Off() {
+	if r == nil {
+		return
+	}
+	r.once.Do(func() { close(r.done) })
+	<-r.exited
+	r.closeFiles()
+}
+
+func (r *Ring) closeFiles() {
+	for _, z := range r.zones {
+		for _, c := range z {
+			if c != nil && c.real != nil {
+				c.real.Close()
+			}
+		}
+	}
+}
+
+func (r *Ring) run() {
+	defer close(r.exited)
+	var (
+		ticker                 *time.Ticker
+		tick                   <-chan time.Time
+		color                  [3]int
+		took, started, lastLit time.Time
+	)
+	stop := func() {
+		if ticker != nil {
+			ticker.Stop()
+			ticker, tick = nil, nil
+			r.release()
+		}
+	}
+	defer stop()
+	for {
+		select {
+		case <-r.done:
+			return
+		case <-r.signal:
+			r.mu.Lock()
+			route := r.route
+			r.mu.Unlock()
+			c, lit := r.colors[route]
+			if !lit {
+				stop()
+				continue
+			}
+			color = c
+			started, lastLit = time.Now(), time.Now()
+			if ticker == nil {
+				if err := r.takeover(); err != nil {
+					slog.Warn("route_indicator_takeover_failed", "error", err)
+					continue
+				}
+				took = time.Now()
+				ticker = time.NewTicker(frame)
+				tick = ticker.C
+			}
+		case now := <-tick:
+			if r.mirror(color, now.Sub(took)) {
+				lastLit = now
+			}
+			if now.Sub(lastLit) >= r.idle || now.Sub(started) >= r.max {
+				stop()
+			}
+		}
+	}
+}
+
+// takeover covers every ring brightness file with a stand-in that starts at the firmware's current value.
+func (r *Ring) takeover() error {
+	var bound []*channel
+	undo := func(err error) error {
+		for _, b := range bound {
+			r.unbind(b)
+		}
+		return err
+	}
+	for _, z := range r.zones {
+		for _, c := range z {
+			c.raw = readValue(c.real, 0)
+			err := os.WriteFile(c.standIn, []byte(strconv.Itoa(c.raw)), 0o644)
+			if err == nil {
+				err = os.Chmod(c.standIn, 0o644)
+			}
+			if err == nil {
+				c.in, err = os.Open(c.standIn)
+			}
+			if err != nil {
+				return undo(err)
+			}
+			if err := r.mount.Bind(c.standIn, c.path); err != nil {
+				c.in.Close()
+				return undo(err)
+			}
+			c.written = -1
+			bound = append(bound, c)
+		}
+	}
+	return nil
+}
+
+// release hands the ring back and restores the firmware's own last frame,
+// in case the firmware holds a static pattern instead of redrawing it.
+func (r *Ring) release() {
+	for _, z := range r.zones {
+		for _, c := range z {
+			r.unbind(c)
+			if _, err := c.real.WriteAt(fmt.Appendf(nil, "%03d\n", c.raw), 0); err == nil {
+				c.written = c.raw
+			}
+		}
+	}
+}
+
+func (r *Ring) unbind(c *channel) {
+	// Detaching cannot fail with EBUSY while the firmware has the file open for a frame.
+	if err := r.mount.Unbind(c.path); err != nil {
+		slog.Warn("route_indicator_release_failed", "path", c.path, "error", err)
+	}
+	if c.in != nil {
+		c.in.Close()
+		c.in = nil
+	}
+}
+
+// mirror repaints the firmware's latest frame in color and reports whether any zone was lit.
+func (r *Ring) mirror(color [3]int, elapsed time.Duration) bool {
+	lit := false
+	for zi, z := range r.zones {
+		level := 0
+		for _, c := range z {
+			// The firmware truncates before writing; an empty read keeps the previous value.
+			c.raw = readValue(c.in, c.raw)
+			level = max(level, c.raw)
+		}
+		lit = lit || level > 0
+		share := float64(level) / 255 * r.wave(zi, elapsed)
+		for i, c := range z {
+			v := int(math.Round(float64(color[i]) * share))
+			if v == c.written {
+				continue
+			}
+			// sysfs accepts leading zeros; the fixed width also keeps regular files in tests parseable.
+			if _, err := c.real.WriteAt(fmt.Appendf(nil, "%03d\n", v), 0); err == nil {
+				c.written = v
+			}
+		}
+	}
+	return lit
+}
+
+// readValue reads a brightness value through an open handle, keeping previous when the read is empty or invalid.
+func readValue(f *os.File, previous int) int {
+	if f == nil {
+		return previous
+	}
+	var buf [16]byte
+	n, _ := f.ReadAt(buf[:], 0)
+	v, err := strconv.Atoi(strings.TrimSpace(string(buf[:n])))
+	if err != nil {
+		return previous
+	}
+	return min(max(v, 0), 255)
+}

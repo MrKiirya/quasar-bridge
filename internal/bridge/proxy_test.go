@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+	"quasarbridge/internal/journal"
 )
 
 // A proxy that decodes and reserializes unknown frames would corrupt future
@@ -66,5 +67,22 @@ func TestProxyRejectsUnavailableUpstreamBeforeUpgrade(t *testing.T) {
 	p.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/uni.ws", nil))
 	if w.Code != http.StatusBadGateway {
 		t.Fatalf("status=%d, want 502", w.Code)
+	}
+}
+
+func TestRouteHookChainsJournalAndListener(t *testing.T) {
+	if routeHook(nil, nil) != nil {
+		t.Fatal("hook created without journal or listener")
+	}
+	trace := newConversation(new(journal.Writer))
+	if routeHook(trace, nil) == nil {
+		t.Fatal("journal route dropped")
+	}
+	var got []string
+	listener := func(id, route string) { got = append(got, id+"="+route) }
+	routeHook(nil, listener)("a", "llm")
+	routeHook(trace, listener)("b", "yandex")
+	if strings.Join(got, ",") != "a=llm,b=yandex" {
+		t.Fatalf("listener calls: %v", got)
 	}
 }
