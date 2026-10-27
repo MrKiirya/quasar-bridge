@@ -570,3 +570,44 @@ func TestNativeReportsRequestStartBeforeRoute(t *testing.T) {
 		}
 	}
 }
+
+func TestNativeWakeWordReachesResolverForVoiceOnly(t *testing.T) {
+	for _, kind := range []string{"voice", "text"} {
+		t.Run(kind, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+			defer cancel()
+			up := make(chan []byte, 16)
+			got := make(chan string, 1)
+			resolver := resolverFunc(func(ctx context.Context, _ string) (Resolution, error) {
+				got <- WakeWord(ctx)
+				return Resolution{Route: "yandex"}, nil
+			})
+			n := NewNative(ctx, func(_ context.Context, _ websocket.MessageType, b []byte) error { up <- b; return nil }, func(context.Context, websocket.MessageType, []byte) error { return nil }, resolver)
+			defer n.Close()
+			var asked time.Time
+			n.WakeWord = func(_ context.Context, at time.Time) string { asked = at; return "товарищ" }
+			if kind == "voice" {
+				voice := aa(&client.TClientMessage{Message: &client.TClientMessage_Event{Event: &client.TClientMessage_TEvent{Header: &header.TEventHeader{MessageId: "voice", StreamId: new(int64(1))}, Event: &client.TClientMessage_TEvent_VoiceInput{VoiceInput: &request.TAliceRequestProto{Request: &request.TAliceRequestProto_TRequest{Event: &common.TEvent{Type: common.EEventType_voice_input.Enum()}}, Format: new("audio/opus")}}}}})
+				_ = n.Client(ctx, websocket.MessageBinary, voice)
+				<-up
+				result := aa(&server.TServerMessage{Message: &server.TServerMessage_Event{Event: &server.TServerMessage_TEvent{Header: &header.TEventHeader{RefMessageId: "voice"}, Event: &server.TServerMessage_TEvent_AsrResult{AsrResult: &asr.TAsrResult{EndOfUtt: new(true), Recognition: []*recognition.TAsrRecognition{{Normalized: new("как дела")}}}}}}})
+				_ = n.Server(ctx, websocket.MessageBinary, result)
+			} else {
+				text := aa(&client.TClientMessage{Message: &client.TClientMessage_Event{Event: &client.TClientMessage_TEvent{Header: &header.TEventHeader{MessageId: "text"}, Event: &client.TClientMessage_TEvent_TextInput{TextInput: &request.TAliceRequestProto{Request: &request.TAliceRequestProto_TRequest{Event: &common.TEvent{Type: common.EEventType_text_input.Enum(), Text: new("как дела")}}}}}}})
+				_ = n.Client(ctx, websocket.MessageBinary, text)
+			}
+			select {
+			case w := <-got:
+				want := map[string]string{"voice": "товарищ", "text": ""}[kind]
+				if w != want {
+					t.Fatalf("wake word %q, want %q", w, want)
+				}
+				if kind == "voice" && asked.IsZero() {
+					t.Fatal("request time not passed")
+				}
+			case <-ctx.Done():
+				t.Fatal("no decision")
+			}
+		})
+	}
+}
