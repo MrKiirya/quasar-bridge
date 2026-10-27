@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -29,7 +30,18 @@ const (
 	frame           = 20 * time.Millisecond
 	// Stacked stand-ins from crashed runs are peeled one mount at a time.
 	maxStacked = 8
+	// The firmware's Pro animations change hue more than brightness, so a recolored copy would look flat;
+	// a breathing wave on top keeps the ring alive while the firmware still decides when and where it is lit.
+	breathPeriod = 1600 * time.Millisecond
+	breathFloor  = 0.45
 )
+
+// breathe is the share of brightness a zone gets after elapsed: it swings between breathFloor and 1,
+// and neighbouring zones lag a little so the wave travels around the ring.
+func breathe(zone int, elapsed time.Duration) float64 {
+	phase := 2*math.Pi*float64(elapsed)/float64(breathPeriod) - float64(zone)*math.Pi/6
+	return breathFloor + (1-breathFloor)*(0.5+0.5*math.Sin(phase))
+}
 
 type Config struct {
 	Enabled bool `json:"enabled"`
@@ -87,6 +99,7 @@ type Ring struct {
 	idle   time.Duration
 	max    time.Duration
 	mount  mounter
+	wave   func(zone int, elapsed time.Duration) float64
 
 	mu     sync.Mutex
 	route  string
@@ -119,10 +132,10 @@ func peel(path string, m mounter) {
 
 // New returns nil when the indicator is disabled or the host has no RGB ring under root.
 func New(cfg Config, root, standIns string) (*Ring, error) {
-	return newRing(cfg, root, standIns, sysMounter{})
+	return newRing(cfg, root, standIns, sysMounter{}, breathe)
 }
 
-func newRing(cfg Config, root, standIns string, m mounter) (*Ring, error) {
+func newRing(cfg Config, root, standIns string, m mounter, wave func(int, time.Duration) float64) (*Ring, error) {
 	if !cfg.Enabled {
 		return nil, nil
 	}
@@ -157,7 +170,7 @@ func newRing(cfg Config, root, standIns string, m mounter) (*Ring, error) {
 	if err := os.Chmod(standIns, 0o755); err != nil {
 		return nil, err
 	}
-	r := &Ring{colors: map[string][3]int{}, idle: time.Duration(cfg.IdleMS) * time.Millisecond, max: time.Duration(cfg.MaxMS) * time.Millisecond, mount: m, signal: make(chan struct{}, 1), done: make(chan struct{}), exited: make(chan struct{})}
+	r := &Ring{colors: map[string][3]int{}, idle: time.Duration(cfg.IdleMS) * time.Millisecond, max: time.Duration(cfg.MaxMS) * time.Millisecond, mount: m, wave: wave, signal: make(chan struct{}, 1), done: make(chan struct{}), exited: make(chan struct{})}
 	for route, color := range cfg.Colors {
 		if color != "" {
 			v, _ := strconv.ParseUint(color[1:], 16, 32)
@@ -240,10 +253,10 @@ func (r *Ring) closeFiles() {
 func (r *Ring) run() {
 	defer close(r.exited)
 	var (
-		ticker           *time.Ticker
-		tick             <-chan time.Time
-		color            [3]int
-		started, lastLit time.Time
+		ticker                 *time.Ticker
+		tick                   <-chan time.Time
+		color                  [3]int
+		took, started, lastLit time.Time
 	)
 	stop := func() {
 		if ticker != nil {
@@ -273,11 +286,12 @@ func (r *Ring) run() {
 					slog.Warn("route_indicator_takeover_failed", "error", err)
 					continue
 				}
+				took = time.Now()
 				ticker = time.NewTicker(frame)
 				tick = ticker.C
 			}
 		case now := <-tick:
-			if r.mirror(color) {
+			if r.mirror(color, now.Sub(took)) {
 				lastLit = now
 			}
 			if now.Sub(lastLit) >= r.idle || now.Sub(started) >= r.max {
@@ -345,9 +359,9 @@ func (r *Ring) unbind(c *channel) {
 }
 
 // mirror repaints the firmware's latest frame in color and reports whether any zone was lit.
-func (r *Ring) mirror(color [3]int) bool {
+func (r *Ring) mirror(color [3]int, elapsed time.Duration) bool {
 	lit := false
-	for _, z := range r.zones {
+	for zi, z := range r.zones {
 		level := 0
 		for _, c := range z {
 			// The firmware truncates before writing; an empty read keeps the previous value.
@@ -355,8 +369,9 @@ func (r *Ring) mirror(color [3]int) bool {
 			level = max(level, c.raw)
 		}
 		lit = lit || level > 0
+		share := float64(level) / 255 * r.wave(zi, elapsed)
 		for i, c := range z {
-			v := (color[i]*level + 127) / 255
+			v := int(math.Round(float64(color[i]) * share))
 			if v == c.written {
 				continue
 			}

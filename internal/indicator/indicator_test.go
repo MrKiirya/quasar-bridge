@@ -83,7 +83,7 @@ func fakeLEDs(t *testing.T, prefix string, n int) string {
 func newTestRing(t *testing.T, zones int, cfg Config, m *fakeMounter) *Ring {
 	t.Helper()
 	cfg.Enabled = true
-	r, err := newRing(cfg, fakeLEDs(t, "mini2", zones), t.TempDir(), m)
+	r, err := newRing(cfg, fakeLEDs(t, "mini2", zones), t.TempDir(), m, steady)
 	if err != nil || r == nil {
 		t.Fatalf("newRing = %v, %v", r, err)
 	}
@@ -170,18 +170,18 @@ func TestValidate(t *testing.T) {
 func TestNewNeedsEnabledCompleteRing(t *testing.T) {
 	m := newMounter()
 	root := fakeLEDs(t, "mini2", 6)
-	if r, err := newRing(DefaultConfig(), root, t.TempDir(), m); r != nil || err != nil {
+	if r, err := newRing(DefaultConfig(), root, t.TempDir(), m, steady); r != nil || err != nil {
 		t.Fatalf("disabled indicator: %v, %v", r, err)
 	}
 	cfg := DefaultConfig()
 	cfg.Enabled = true
-	if r, err := newRing(cfg, t.TempDir(), t.TempDir(), m); r != nil || err != nil {
+	if r, err := newRing(cfg, t.TempDir(), t.TempDir(), m, steady); r != nil || err != nil {
 		t.Fatalf("indicator without LEDs: %v, %v", r, err)
 	}
 	if err := os.RemoveAll(filepath.Join(root, "mini2:blue:ring6")); err != nil {
 		t.Fatal(err)
 	}
-	r, err := newRing(cfg, root, t.TempDir(), m)
+	r, err := newRing(cfg, root, t.TempDir(), m, steady)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -198,7 +198,7 @@ func TestNewPeelsStackedLeftoversBeforeOpening(t *testing.T) {
 	m.bound[red] = 3
 	cfg := DefaultConfig()
 	cfg.Enabled = true
-	r, err := newRing(cfg, root, t.TempDir(), m)
+	r, err := newRing(cfg, root, t.TempDir(), m, steady)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -215,7 +215,7 @@ func TestNewRejectsHandleThatIsNotRealLED(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.Enabled = true
 	m := &rejectingMounter{fakeMounter: newMounter()}
-	if r, err := newRing(cfg, fakeLEDs(t, "mini2", 2), t.TempDir(), m); r != nil || err == nil {
+	if r, err := newRing(cfg, fakeLEDs(t, "mini2", 2), t.TempDir(), m, steady); r != nil || err == nil {
 		t.Fatalf("newRing = %v, %v; want an error", r, err)
 	}
 }
@@ -384,5 +384,44 @@ func TestNilRingIsInert(t *testing.T) {
 	r.Off()
 	if r.Zones() != 0 {
 		t.Fatal("nil ring reports zones")
+	}
+}
+
+// steady keeps the firmware brightness as is, so tests can expect exact colors.
+func steady(int, time.Duration) float64 { return 1 }
+
+func TestBreatheSwingsAndTravels(t *testing.T) {
+	lo, hi := 1.0, 0.0
+	for ms := 0; ms < int(breathPeriod/time.Millisecond); ms += 20 {
+		v := breathe(0, time.Duration(ms)*time.Millisecond)
+		lo, hi = min(lo, v), max(hi, v)
+	}
+	if lo < breathFloor-0.01 || lo > breathFloor+0.01 || hi < 0.99 || hi > 1 {
+		t.Fatalf("breath range = %.2f..%.2f, want %.2f..1", lo, hi, breathFloor)
+	}
+	if breathe(0, breathPeriod/4) == breathe(3, breathPeriod/4) {
+		t.Fatal("zones breathe in lockstep; the wave must travel")
+	}
+}
+
+func TestRingBreathesWhileFirmwareHoldsSteadyFrame(t *testing.T) {
+	m := newMounter()
+	cfg := config(10000, 60000)
+	cfg.Enabled = true
+	r, err := newRing(cfg, fakeLEDs(t, "mini2", 1), t.TempDir(), m, breathe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Off()
+	setLED(t, r, 0, alicePurple)
+	r.Route("a", "llm")
+	seen := map[int]bool{}
+	deadline := time.Now().Add(breathPeriod)
+	for time.Now().Before(deadline) {
+		seen[ledValue(t, r, 0)[0]] = true
+		time.Sleep(20 * time.Millisecond)
+	}
+	if len(seen) < 10 {
+		t.Fatalf("red channel took %d distinct values over one breath; the ring looks flat", len(seen))
 	}
 }
