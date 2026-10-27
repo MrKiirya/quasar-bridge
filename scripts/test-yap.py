@@ -38,6 +38,19 @@ class PackageTest(unittest.TestCase):
             self.assertEqual(checksum[1], output.name)
             self.assertEqual(checksum[0], hashlib.sha256(package.read_bytes()).hexdigest())
 
+    def test_suffix_marks_package_version(self):
+        version = tomllib.loads((ROOT / "packaging/yam/plugin.toml").read_text())["version"]
+        with tempfile.TemporaryDirectory() as tmp:
+            binary = Path(tmp) / "arm64"
+            binary.write_bytes(b"\x7fELF\x02" + bytes(13) + b"\xb7\x00" + bytes(44))
+            with zipfile.ZipFile(builder.build(Path(tmp) / "suffix.yap", binary, suffix="mrkiirya.7")) as z:
+                self.assertEqual(tomllib.loads(z.read("plugin.toml").decode())["version"], version + "+mrkiirya.7")
+            for suffix in ("", "a..b", "bad suffix", "+x"):
+                with self.subTest(suffix=suffix), self.assertRaisesRegex(ValueError, "build suffix"):
+                    builder.build(Path(tmp) / "bad.yap", binary, suffix=suffix)
+            with self.assertRaisesRegex(ValueError, "build suffix"):
+                builder.build(Path(tmp) / "tag.yap", binary, tag="v" + version, suffix="mrkiirya.7")
+
     def test_payload_and_persistent_state(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
