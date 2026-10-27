@@ -1,13 +1,52 @@
 package indicator
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
+
+// fakeMounter records bind mounts; the test plays the firmware by writing into stand-ins.
+type fakeMounter struct {
+	mu      sync.Mutex
+	bound   map[string]bool
+	binds   int
+	unbinds int
+	failAt  int // fail the n-th Bind (1-based); 0 never fails
+}
+
+func (m *fakeMounter) Bind(_, target string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.binds++
+	if m.failAt != 0 && m.binds == m.failAt {
+		return errors.New("bind failed")
+	}
+	m.bound[target] = true
+	return nil
+}
+
+func (m *fakeMounter) Unbind(target string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.unbinds++
+	if !m.bound[target] {
+		return errors.New("not mounted")
+	}
+	delete(m.bound, target)
+	return nil
+}
+
+func (m *fakeMounter) mounted() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.bound)
+}
 
 // fakeLEDs creates sysfs-like brightness files for zones 1..n under a temp root.
 func fakeLEDs(t *testing.T, prefix string, n int) string {
@@ -19,7 +58,7 @@ func fakeLEDs(t *testing.T, prefix string, n int) string {
 			if err := os.MkdirAll(dir, 0o755); err != nil {
 				t.Fatal(err)
 			}
-			if err := os.WriteFile(filepath.Join(dir, "brightness"), []byte("0"), 0o644); err != nil {
+			if err := os.WriteFile(filepath.Join(dir, "brightness"), []byte("0\n"), 0o644); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -27,47 +66,55 @@ func fakeLEDs(t *testing.T, prefix string, n int) string {
 	return root
 }
 
-func colors(t *testing.T, r *Ring) [][3]int {
+func newTestRing(t *testing.T, zones int, cfg Config, m *fakeMounter) *Ring {
 	t.Helper()
-	var out [][3]int
-	for _, z := range r.zones {
-		var c [3]int
-		for i, path := range [3]string{z.red, z.green, z.blue} {
-			data, err := os.ReadFile(path)
-			if err != nil {
-				t.Fatal(err)
-			}
-			c[i], _ = strconv.Atoi(strings.TrimSpace(string(data)))
+	cfg.Enabled = true
+	r, err := newRing(cfg, fakeLEDs(t, "mini2", zones), t.TempDir(), m)
+	if err != nil || r == nil {
+		t.Fatalf("newRing = %v, %v", r, err)
+	}
+	t.Cleanup(r.Off)
+	return r
+}
+
+func config(idle, maxMS int) Config {
+	cfg := DefaultConfig()
+	cfg.IdleMS, cfg.MaxMS = idle, maxMS
+	return cfg
+}
+
+// firmware writes one frame into the stand-ins, as the speaker firmware would through the bind mounts.
+func firmware(t *testing.T, r *Ring, zone int, rgb [3]int) {
+	t.Helper()
+	for i, c := range r.zones[zone] {
+		if err := os.WriteFile(c.standIn, []byte(strconv.Itoa(rgb[i])), 0o644); err != nil {
+			t.Fatal(err)
 		}
-		out = append(out, c)
+	}
+}
+
+func ledValue(t *testing.T, r *Ring, zone int) [3]int {
+	t.Helper()
+	var out [3]int
+	for i, c := range r.zones[zone] {
+		data, err := os.ReadFile(c.path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out[i], _ = strconv.Atoi(strings.TrimSpace(string(data)))
 	}
 	return out
 }
 
-func waitColor(t *testing.T, r *Ring, want [3]int) {
+func eventually(t *testing.T, what string, ok func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		got := colors(t, r)
-		ok := true
-		for _, c := range got {
-			ok = ok && c == want
-		}
-		if ok {
-			return
-		}
+	deadline := time.Now().Add(3 * time.Second)
+	for !ok() {
 		if time.Now().After(deadline) {
-			t.Fatalf("ring = %v, want every zone %v", got, want)
+			t.Fatal("timed out waiting for " + what)
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-}
-
-func enabled(duration int) Config {
-	cfg := DefaultConfig()
-	cfg.Enabled = true
-	cfg.DurationMS = duration
-	return cfg
 }
 
 func TestValidate(t *testing.T) {
@@ -75,85 +122,143 @@ func TestValidate(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, tc := range []Config{
-		{DurationMS: 99},
-		{DurationMS: 60001},
-		{DurationMS: 4000, Colors: map[string]string{"classify": "#ffffff"}},
-		{DurationMS: 4000, Colors: map[string]string{"llm": "blue"}},
-		{DurationMS: 4000, Colors: map[string]string{"llm": "#12345"}},
+		{IdleMS: 99, MaxMS: 60000},
+		{IdleMS: 600, MaxMS: 999},
+		{IdleMS: 600, MaxMS: 60000, Colors: map[string]string{"classify": "#ffffff"}},
+		{IdleMS: 600, MaxMS: 60000, Colors: map[string]string{"llm": "blue"}},
+		{IdleMS: 600, MaxMS: 60000, Colors: map[string]string{"llm": "#12345"}},
 	} {
 		if tc.Validate() == nil {
 			t.Fatalf("accepted %+v", tc)
 		}
 	}
-	if err := (Config{DurationMS: 4000, Colors: map[string]string{"yandex": ""}}).Validate(); err != nil {
-		t.Fatalf("empty color must disable a route: %v", err)
+	if err := (Config{IdleMS: 600, MaxMS: 60000, Colors: map[string]string{"llm": "", "playback": "#ffffff"}}).Validate(); err != nil {
+		t.Fatalf("empty color and playback route must be accepted: %v", err)
 	}
 }
 
 func TestNewNeedsEnabledCompleteRing(t *testing.T) {
+	m := &fakeMounter{bound: map[string]bool{}}
 	root := fakeLEDs(t, "mini2", 6)
-	if New(DefaultConfig(), root) != nil {
-		t.Fatal("disabled indicator created")
+	if r, err := newRing(DefaultConfig(), root, t.TempDir(), m); r != nil || err != nil {
+		t.Fatalf("disabled indicator: %v, %v", r, err)
 	}
-	if New(enabled(4000), t.TempDir()) != nil {
-		t.Fatal("indicator without LEDs created")
+	cfg := DefaultConfig()
+	cfg.Enabled = true
+	if r, err := newRing(cfg, t.TempDir(), t.TempDir(), m); r != nil || err != nil {
+		t.Fatalf("indicator without LEDs: %v, %v", r, err)
 	}
 	if err := os.RemoveAll(filepath.Join(root, "mini2:blue:ring6")); err != nil {
 		t.Fatal(err)
 	}
-	if got := New(enabled(4000), root).Zones(); got != 5 {
-		t.Fatalf("zones = %d, want 5 complete zones", got)
+	r, err := newRing(cfg, root, t.TempDir(), m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Off()
+	if r.Zones() != 5 {
+		t.Fatalf("zones = %d, want 5 complete zones", r.Zones())
+	}
+}
+
+func TestNewClearsLeftoverStandInsBeforeOpening(t *testing.T) {
+	m := &fakeMounter{bound: map[string]bool{}}
+	r := newTestRing(t, 6, config(600, 60000), m)
+	if m.unbinds != 18 || m.binds != 0 {
+		t.Fatalf("startup unbinds = %d, binds = %d; want 18 and 0", m.unbinds, m.binds)
+	}
+	if !strings.Contains(r.zones[0][0].standIn, "mini2_red_ring1") {
+		t.Fatalf("stand-in name: %s", r.zones[0][0].standIn)
 	}
 }
 
 func TestZonesSortedNumerically(t *testing.T) {
-	r := New(enabled(4000), fakeLEDs(t, "mini2", 10))
-	if !strings.Contains(r.zones[1].red, "ring2") || !strings.Contains(r.zones[9].red, "ring10") {
-		t.Fatalf("zone order: %s ... %s", r.zones[1].red, r.zones[9].red)
+	r := newTestRing(t, 10, config(600, 60000), &fakeMounter{bound: map[string]bool{}})
+	if !strings.Contains(r.zones[1][0].path, "ring2") || !strings.Contains(r.zones[9][0].path, "ring10") {
+		t.Fatalf("zone order: %s ... %s", r.zones[1][0].path, r.zones[9][0].path)
 	}
 }
 
-func TestRouteLightsThenClears(t *testing.T) {
-	r := New(enabled(100), fakeLEDs(t, "mini2", 6))
-	r.Route("req", "llm")
-	waitColor(t, r, [3]int{0x00, 0x50, 0xff})
-	waitColor(t, r, [3]int{})
+func TestRecolorsFirmwareFramesKeepingBrightness(t *testing.T) {
+	m := &fakeMounter{bound: map[string]bool{}}
+	r := newTestRing(t, 6, config(600, 60000), m)
+	r.Route("a", "llm")
+	eventually(t, "takeover", func() bool { return m.mounted() == 18 })
+	firmware(t, r, 0, [3]int{0x6b, 0x0f, 0xff})
+	firmware(t, r, 1, [3]int{0, 0, 128})
+	eventually(t, "full zone", func() bool { return ledValue(t, r, 0) == [3]int{217, 119, 87} })
+	eventually(t, "half zone", func() bool { return ledValue(t, r, 1) == [3]int{109, 60, 44} })
+	if got := ledValue(t, r, 2); got != ([3]int{}) {
+		t.Fatalf("dark zone = %v", got)
+	}
 }
 
-func TestUnlitRouteClearsImmediately(t *testing.T) {
-	cfg := enabled(60000)
-	cfg.Colors["yandex"] = ""
-	r := New(cfg, fakeLEDs(t, "mini2", 3))
+func TestReleasesWhenFirmwareGoesDark(t *testing.T) {
+	m := &fakeMounter{bound: map[string]bool{}}
+	r := newTestRing(t, 6, config(100, 60000), m)
 	r.Route("a", "home")
-	waitColor(t, r, [3]int{0xff, 0xa0, 0x00})
-	r.Route("b", "yandex")
-	waitColor(t, r, [3]int{})
-}
-
-func TestLaterRouteReplacesEarlierTimer(t *testing.T) {
-	r := New(enabled(300), fakeLEDs(t, "mini2", 2))
-	r.Route("a", "llm")
-	time.Sleep(200 * time.Millisecond)
-	r.Route("b", "home")
-	time.Sleep(150 * time.Millisecond)
-	// The first timer would have fired by now; the second route must still be lit.
-	for _, c := range colors(t, r) {
-		if c != [3]int{0xff, 0xa0, 0x00} {
-			t.Fatalf("ring = %v after replaced timer", colors(t, r))
-		}
+	eventually(t, "takeover", func() bool { return m.mounted() == 18 })
+	firmware(t, r, 0, [3]int{0x6b, 0x0f, 0xff})
+	eventually(t, "home color", func() bool { return ledValue(t, r, 0) == [3]int{0x18, 0xbc, 0xf2} })
+	firmware(t, r, 0, [3]int{})
+	eventually(t, "release", func() bool { return m.mounted() == 0 })
+	if got := ledValue(t, r, 0); got != ([3]int{}) {
+		t.Fatalf("ring left lit after release: %v", got)
 	}
-	waitColor(t, r, [3]int{})
 }
 
-func TestOffDarkensSynchronously(t *testing.T) {
-	r := New(enabled(60000), fakeLEDs(t, "mini2", 6))
+func TestUncoloredRouteReleasesTakeover(t *testing.T) {
+	m := &fakeMounter{bound: map[string]bool{}}
+	r := newTestRing(t, 6, config(10000, 60000), m)
 	r.Route("a", "llm")
-	waitColor(t, r, [3]int{0x00, 0x50, 0xff})
+	eventually(t, "takeover", func() bool { return m.mounted() == 18 })
+	r.Route("b", "yandex")
+	eventually(t, "release", func() bool { return m.mounted() == 0 })
+}
+
+func TestUncoloredRouteWhileIdleLeavesRingAlone(t *testing.T) {
+	m := &fakeMounter{bound: map[string]bool{}}
+	r := newTestRing(t, 6, config(600, 60000), m)
+	if err := os.WriteFile(r.zones[0][2].path, []byte("200\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	r.Route("a", "yandex")
+	r.Route("b", "playback")
+	time.Sleep(100 * time.Millisecond)
+	if m.binds != 0 || ledValue(t, r, 0)[2] != 200 {
+		t.Fatalf("binds = %d, ring = %v; firmware colors must stay untouched", m.binds, ledValue(t, r, 0))
+	}
+}
+
+func TestMaxEndsTakeoverEvenWhileLit(t *testing.T) {
+	m := &fakeMounter{bound: map[string]bool{}}
+	r := newTestRing(t, 2, config(10000, 1000), m)
+	r.Route("a", "llm")
+	eventually(t, "takeover", func() bool { return m.mounted() == 6 })
+	firmware(t, r, 0, [3]int{0x6b, 0x0f, 0xff})
+	eventually(t, "release by max_ms", func() bool { return m.mounted() == 0 })
+}
+
+func TestOffReleasesSynchronously(t *testing.T) {
+	m := &fakeMounter{bound: map[string]bool{}}
+	r := newTestRing(t, 6, config(10000, 60000), m)
+	r.Route("a", "llm")
+	eventually(t, "takeover", func() bool { return m.mounted() == 18 })
 	r.Off()
-	for _, c := range colors(t, r) {
-		if c != ([3]int{}) {
-			t.Fatalf("ring = %v right after Off", colors(t, r))
-		}
+	if m.mounted() != 0 {
+		t.Fatalf("%d stand-ins still mounted after Off", m.mounted())
+	}
+	r.Route("b", "llm")
+}
+
+func TestFailedTakeoverRollsBack(t *testing.T) {
+	m := &fakeMounter{bound: map[string]bool{}, failAt: 5}
+	r := newTestRing(t, 6, config(600, 60000), m)
+	r.Route("a", "llm")
+	eventually(t, "attempt", func() bool { m.mu.Lock(); defer m.mu.Unlock(); return m.binds >= 5 })
+	time.Sleep(50 * time.Millisecond)
+	if m.mounted() != 0 {
+		t.Fatalf("%d stand-ins left after failed takeover", m.mounted())
 	}
 }
 
