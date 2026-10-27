@@ -108,6 +108,16 @@ func WithWakeWord(ctx context.Context, word string) context.Context {
 // WakeWord returns the custom wake word of the request, "" for the stock one.
 func WakeWord(ctx context.Context) string { s, _ := ctx.Value(wakeWordKey{}).(string); return s }
 
+type conversationKey struct{}
+
+// WithConversation marks a voice request that continues a conversation with the LLM.
+func WithConversation(ctx context.Context) context.Context {
+	return context.WithValue(ctx, conversationKey{}, true)
+}
+
+// Conversation reports whether the request continues a conversation with the LLM.
+func Conversation(ctx context.Context) bool { v, _ := ctx.Value(conversationKey{}).(bool); return v }
+
 func directRoute(route string) bool { return route == "home" || route == "llm" || route == "yandex" }
 func foldTerms(terms []string, refusal bool) ([]string, error) {
 	out := make([]string, len(terms))

@@ -45,6 +45,7 @@ type config struct {
 	LLMChatParameters  map[string]any       `json:"llm_chat_parameters"`
 	HomeWarmArea       string               `json:"home_warm_area"`
 	ListenAfterReply   bool                 `json:"listen_after_reply"`
+	LLMConversation    bool                 `json:"llm_conversation"`
 	Routing            bridge.RoutingConfig `json:"routing"`
 	Prompts            bridge.PromptFiles   `json:"prompts"`
 	RouteIndicator     indicator.Config     `json:"route_indicator"`
@@ -180,6 +181,9 @@ func readConfig(path string) (config, error) {
 	}
 	if err := cfg.WakeWord.Validate(); err != nil {
 		return cfg, err
+	}
+	if cfg.LLMConversation && !cfg.ListenAfterReply {
+		return cfg, errors.New("llm_conversation requires listen_after_reply")
 	}
 	if _, err := bridge.CompileRouting(cfg.Routing); err != nil {
 		return cfg, err

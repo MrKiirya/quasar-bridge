@@ -233,6 +233,13 @@ func (e *Engine) Decide(ctx context.Context, text string) (decision RouteDecisio
 		}
 		return d
 	}
+	if Conversation(ctx) {
+		d := RouteDecision{Route: "llm", Source: "conversation"}
+		if e.Music != nil && e.Music.CanStartMusic(text) {
+			d.Route = "music"
+		}
+		return d
+	}
 	if len(snapshot.Messages) > 0 && dialogue.IsFollowup(text) {
 		return RouteDecision{Route: "llm", Source: "dialogue"}
 	}

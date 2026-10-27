@@ -99,7 +99,24 @@ type Native struct {
 	WakeWord func(context.Context, time.Time) string
 	// OnWakeWord is told the custom wake word of a native request, after the journal.
 	OnWakeWord func(id, word string)
+	// KeepConversation keeps the LLM route for a voice request that the speaker
+	// opens on its own right after a fully played LLM answer (listen_after_reply).
+	KeepConversation bool
+	// listening is the last LLM answer that asked the speaker to listen again;
+	// played is the last request whose answer finished playing uninterrupted.
+	listening string
+	played    playedAnswer
 }
+
+type playedAnswer struct {
+	id string
+	at time.Time
+}
+
+// followGap bounds the time from a finished answer to the request that follows
+// it: the speaker reports the answer played about 50 ms before listening again,
+// while a stock wake word after the answer comes seconds later or interrupts it.
+const followGap = time.Second
 
 // usesWakeWord reports whether the resolver's current rules read the wake word.
 func usesWakeWord(r Resolver) bool {
@@ -141,7 +158,13 @@ func (n *Native) Client(ctx context.Context, k websocket.MessageType, data []byt
 		}
 		timestamps := stat.GetTimestamps()
 		reported := func(value string) bool { return value != "" && value != "0" }
-		slog.Info("native_playback_status", "request", requestTag(stat.GetRequestMessageId()), "error_class", kind, "playback_reported", reported(timestamps.GetOnSoundPlayerBeginTime()) || reported(timestamps.GetOnPlayerBegin()), "finished_reported", reported(timestamps.GetOnSoundPlayerEndTime()) || reported(timestamps.GetOnPlayerEnd()))
+		finished := reported(timestamps.GetOnSoundPlayerEndTime()) || reported(timestamps.GetOnPlayerEnd())
+		slog.Info("native_playback_status", "request", requestTag(stat.GetRequestMessageId()), "error_class", kind, "playback_reported", reported(timestamps.GetOnSoundPlayerBeginTime()) || reported(timestamps.GetOnPlayerBegin()), "finished_reported", finished)
+		if finished && !reported(timestamps.GetOnInterruptionPhraseSpottedTime()) {
+			n.mu.Lock()
+			n.played = playedAnswer{id: stat.GetRequestMessageId(), at: time.Now()}
+			n.mu.Unlock()
+		}
 	}
 	var req *request.TAliceRequestProto
 	switch f.Kind() {
@@ -220,6 +243,12 @@ func (n *Native) Client(ctx context.Context, k websocket.MessageType, data []byt
 			}
 		})
 		n.requests[id] = p
+		if n.KeepConversation && !p.isText && n.listening != "" && n.played.id == n.listening && received.Sub(n.played.at) < followGap {
+			p.ctx = WithConversation(p.ctx)
+			slog.Info("native_conversation", "request", requestTag(id), "after", requestTag(n.listening))
+		}
+		// Any later request ends the conversation unless it is answered by the LLM again.
+		n.listening = ""
 		if n.OnStart != nil {
 			n.OnStart(id)
 		}
@@ -685,6 +714,11 @@ func (n *Native) reply(p *nativeRequest, text string) error {
 	}
 	if err := n.down(p.ctx, websocket.MessageBinary, b); err != nil {
 		return err
+	}
+	if answer.VoiceResponse.ShouldListen && p.route == "llm" {
+		n.mu.Lock()
+		n.listening = p.id
+		n.mu.Unlock()
 	}
 	n.captureDelivered(p, text, true, silentPlayback || len(answer.Response.Directives) > 0, true)
 	if silentPlayback {

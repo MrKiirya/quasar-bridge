@@ -105,6 +105,15 @@ func TestReadConfigAcceptsListenAfterReply(t *testing.T) {
 		})
 	}
 }
+func TestReadConfigLLMConversationNeedsListenAfterReply(t *testing.T) {
+	cfg, err := readConfig(configFile(t, `{"llm_conversation":true}`))
+	if err != nil || !cfg.LLMConversation {
+		t.Fatalf("cfg=%v err=%v", cfg.LLMConversation, err)
+	}
+	if _, err := readConfig(configFile(t, `{"llm_conversation":true,"listen_after_reply":false}`)); err == nil {
+		t.Fatal("llm_conversation accepted without listen_after_reply")
+	}
+}
 func TestReadConfigEnvironmentOverridesDeploymentSettings(t *testing.T) {
 	t.Setenv("QUASAR_MODE", "hybrid")
 	t.Setenv("QUASAR_LISTEN", "localhost:9443")
