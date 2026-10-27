@@ -17,6 +17,10 @@ type Proxy struct {
 	Upstream   string
 	Observer   func(direction string, kind websocket.MessageType, data []byte)
 	NewSession func(context.Context, Sender, Sender) Session
+	// OnRoute is told the route of each native request, after the journal.
+	OnRoute func(id, route string)
+	// OnStart is told when a native request begins, before its route is known.
+	OnStart func(id string)
 }
 
 type Sender func(context.Context, websocket.MessageType, []byte) error
@@ -87,8 +91,9 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if p.NewSession != nil {
 		session = p.NewSession(ctx, up.Write, downSend)
-		if n, ok := session.(*Native); ok && trace != nil {
-			n.OnRoute = trace.route
+		if n, ok := session.(*Native); ok {
+			n.OnRoute = routeHook(trace, p.OnRoute)
+			n.OnStart = p.OnStart
 		}
 		defer session.Close()
 	}
@@ -133,4 +138,18 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	wg.Go(func() { copyMessages(up, down, "client") })
 	wg.Go(func() { copyMessages(down, up, "server") })
 	wg.Wait()
+}
+
+// routeHook chains the journal trace and an external route listener; nil when neither is set.
+func routeHook(trace *conversation, hook func(id, route string)) func(id, route string) {
+	switch {
+	case trace == nil:
+		return hook
+	case hook == nil:
+		return trace.route
+	}
+	return func(id, route string) {
+		trace.route(id, route)
+		hook(id, route)
+	}
 }
