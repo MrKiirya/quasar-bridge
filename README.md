@@ -4,6 +4,8 @@
 
 # Quasar Bridge
 
+> Форк [skrashevich/quasar-bridge](https://github.com/skrashevich/quasar-bridge), отличия — в [FORK.md](FORK.md).
+
 Quasar Bridge позволяет обращаться к своей нейросети и управлять устройствами
 Home Assistant через Яндекс Станцию. Вы по-прежнему говорите «Алиса», а программа
 выбирает, кому передать запрос: Яндексу, нейросети или Home Assistant.
