@@ -112,8 +112,13 @@ type framebuffer struct {
 	scale float64
 }
 
-// triggerState lists the triggers detached by a framebuffer takeover, so a crashed run can attach them again.
-const triggerState = "triggers"
+const (
+	// triggerState lists the triggers detached by a framebuffer takeover, so a crashed run can attach them again.
+	triggerState = "triggers"
+	scaleSamples = 3
+	// minScale keeps a badly timed sample from dimming the indicator until the next takeover.
+	minScale = 0.05
+)
 
 type Ring struct {
 	zones  [][3]*channel
@@ -150,19 +155,38 @@ func cleanup(root, standIns string, m mounter) {
 	if err != nil {
 		return
 	}
+	ring := filepath.Join(root, "*:ring*", "trigger")
+	failed := false
 	for line := range strings.Lines(string(data)) {
 		path, trigger, ok := strings.Cut(strings.TrimSpace(line), "\t")
-		if ok {
-			attach(path, trigger)
+		// The state file lives in /tmp: only ring trigger files are written back.
+		if match, _ := filepath.Match(ring, path); ok && match && !attach(path, trigger) {
+			failed = true
 		}
 	}
-	os.Remove(state)
+	if !failed {
+		os.Remove(state)
+	}
 }
 
-func attach(path, trigger string) {
+func attach(path, trigger string) bool {
 	if err := os.WriteFile(path, []byte(trigger), 0); err != nil {
 		slog.Warn("route_indicator_trigger_failed", "path", path, "trigger", trigger, "error", err)
+		return false
 	}
+	return true
+}
+
+// framebufferTrigger names the trigger that copies a framebuffer to this LED, from the trigger file's list.
+func framebufferTrigger(path string) string {
+	data, _ := os.ReadFile(path)
+	for _, name := range strings.Fields(string(data)) {
+		name = strings.Trim(name, "[]")
+		if strings.Contains(name, "fb") && strings.Contains(name, "ring") {
+			return name
+		}
+	}
+	return ""
 }
 
 // activeTrigger reads the bracketed trigger from a sysfs trigger file; a plain value is taken as is.
@@ -293,28 +317,49 @@ func newRing(cfg Config, root, standIns string, m mounter, wave func(int, time.D
 		}
 		r.zones = append(r.zones, zone)
 	}
-	for _, z := range r.zones {
-		for _, c := range z {
-			if c.trigger == "none" {
-				continue
-			}
-			fb, err := findRingFramebuffer(root)
-			if err == nil && fb == nil {
-				err = fmt.Errorf("ring LEDs follow trigger %q but no ring framebuffer was found", c.trigger)
-			}
-			if err != nil {
-				r.closeFiles()
-				return nil, err
-			}
-			r.fb = fb
-			break
-		}
-		if r.fb != nil {
-			break
-		}
+	if err := r.detectFramebuffer(root); err != nil {
+		r.closeFiles()
+		return nil, err
 	}
 	go r.run()
 	return r, nil
+}
+
+// detectFramebuffer switches to the framebuffer mode when the ring LEDs follow a kernel trigger.
+// A ring left with "none" (a crashed run, a manual write) is still recognized by its framebuffer
+// trigger in the list, but only next to a ring framebuffer; without one the sysfs mode stays.
+func (r *Ring) detectFramebuffer(root string) error {
+	driven := ""
+	for _, z := range r.zones {
+		for _, c := range z {
+			if c.trigger != "none" && driven == "" {
+				driven = c.trigger
+			}
+		}
+	}
+	fb, err := findRingFramebuffer(root)
+	if err != nil {
+		return err
+	}
+	if fb == nil {
+		if driven != "" {
+			return fmt.Errorf("ring LEDs follow trigger %q but no ring framebuffer was found", driven)
+		}
+		return nil
+	}
+	if driven == "" && framebufferTrigger(triggerPath(r.zones[0][0])) == "" {
+		fb.file.Close()
+		return nil
+	}
+	for _, z := range r.zones {
+		for _, c := range z {
+			if t := framebufferTrigger(triggerPath(c)); c.trigger == "none" && t != "" {
+				c.trigger = t
+			}
+		}
+	}
+	r.fb = fb
+	return nil
 }
 
 func exists(path string) bool {
@@ -417,6 +462,10 @@ func (r *Ring) run() {
 				took = time.Now()
 				ticker = time.NewTicker(frame)
 				tick = ticker.C
+				if r.fb != nil {
+					// Detaching a trigger darkens the LED; paint at once instead of a frame later.
+					r.mirror(color, 0)
+				}
 			}
 		case now := <-tick:
 			if r.mirror(color, now.Sub(took)) {
@@ -508,17 +557,27 @@ func (r *Ring) takeoverFramebuffer() error {
 }
 
 // learnScale compares the LEDs with the frame the kernel copied them from, while the trigger still runs.
-// A dark ring teaches nothing, so the previous scale is kept.
+// The two reads are not simultaneous and the LEDs lag a rising animation, so the largest of a few samples
+// wins and the scale never drops below minScale. A dark ring teaches nothing, so the previous scale is kept.
 func (r *Ring) learnScale() {
-	fbMax := r.readFramebuffer()
-	led := 0
-	for _, z := range r.zones {
-		for _, c := range z {
-			led = max(led, readValue(c.real, 0))
+	best := 0.0
+	for i := range scaleSamples {
+		if i > 0 {
+			time.Sleep(frame)
+		}
+		fbMax := r.readFramebuffer()
+		led := 0
+		for _, z := range r.zones {
+			for _, c := range z {
+				led = max(led, readValue(c.real, 0))
+			}
+		}
+		if fbMax > 0 && led > 0 {
+			best = max(best, float64(led)/float64(fbMax))
 		}
 	}
-	if fbMax > 0 && led > 0 {
-		r.fb.scale = min(float64(led)/float64(fbMax), 1)
+	if best > 0 {
+		r.fb.scale = min(max(best, minScale), 1)
 	}
 }
 
