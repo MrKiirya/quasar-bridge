@@ -277,7 +277,7 @@ func main() {
 		}
 	}
 	// A run killed mid-takeover leaves the ring frozen; repair it even when the indicator is off.
-	indicator.Cleanup(indicator.DefaultRoot)
+	indicator.Cleanup(indicator.DefaultRoot, indicator.DefaultStandIns)
 	// Routes are only reported by native hybrid sessions, so observe mode never recolors the ring.
 	var ring *indicator.Ring
 	switch {
@@ -293,7 +293,7 @@ func main() {
 			proxy.OnRoute = ring.Route
 			proxy.OnStart = ring.Start
 			defer ring.Off()
-			slog.Info("route_indicator", "zones", ring.Zones())
+			slog.Info("route_indicator", "zones", ring.Zones(), "mode", ring.Mode())
 		}
 	}
 	mux := http.NewServeMux()
