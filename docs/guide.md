@@ -799,7 +799,7 @@ Home Assistant отвечает дольше, включите серверно�
 {
   "route_indicator": {
     "enabled": true,
-    "colors": {"llm": "#d97757", "home": "#18bcf2", "music": "#00c8b4"}
+    "colors": {"llm": "#ff5000", "home": "#18bcf2", "music": "#00c8b4"}
   }
 }
 ```

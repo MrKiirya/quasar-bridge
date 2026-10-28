@@ -59,7 +59,7 @@ type Config struct {
 }
 
 func DefaultConfig() Config {
-	return Config{Colors: map[string]string{"llm": "#d97757", "home": "#18bcf2", "music": "#00c8b4"}, IdleMS: 600, MaxMS: 60000}
+	return Config{Colors: map[string]string{"llm": "#ff5000", "home": "#18bcf2", "music": "#00c8b4"}, IdleMS: 600, MaxMS: 60000}
 }
 
 var hexColor = regexp.MustCompile(`^#[0-9a-fA-F]{6}$`)

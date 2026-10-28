@@ -144,7 +144,7 @@ func eventually(t *testing.T, what string, ok func() bool) {
 
 var (
 	alicePurple = [3]int{0x6b, 0x0f, 0xff}
-	claude      = [3]int{0xd9, 0x77, 0x57}
+	llmColor    = [3]int{0xff, 0x50, 0x00}
 	homeBlue    = [3]int{0x18, 0xbc, 0xf2}
 )
 
@@ -249,9 +249,9 @@ func TestRecolorsFirmwareFramesKeepingBrightness(t *testing.T) {
 	setLED(t, r, 0, alicePurple)
 	r.Route("a", "llm")
 	eventually(t, "takeover", func() bool { return m.mounted() == 18 })
-	eventually(t, "frame copied at takeover", func() bool { return ledValue(t, r, 0) == claude })
+	eventually(t, "frame copied at takeover", func() bool { return ledValue(t, r, 0) == llmColor })
 	firmware(t, r, 1, [3]int{0, 0, 128})
-	eventually(t, "half zone", func() bool { return ledValue(t, r, 1) == [3]int{109, 60, 44} })
+	eventually(t, "half zone", func() bool { return ledValue(t, r, 1) == [3]int{128, 40, 0} })
 	if got := ledValue(t, r, 2); got != ([3]int{}) {
 		t.Fatalf("dark zone = %v", got)
 	}
@@ -262,14 +262,14 @@ func TestEmptyStandInKeepsPreviousLevel(t *testing.T) {
 	r := newTestRing(t, 1, config(600, 60000), m)
 	setLED(t, r, 0, alicePurple)
 	r.Route("a", "llm")
-	eventually(t, "recolor", func() bool { return ledValue(t, r, 0) == claude })
+	eventually(t, "recolor", func() bool { return ledValue(t, r, 0) == llmColor })
 	for _, c := range r.zones[0] {
 		if err := os.WriteFile(c.standIn, nil, 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
 	time.Sleep(100 * time.Millisecond)
-	if got := ledValue(t, r, 0); got != claude {
+	if got := ledValue(t, r, 0); got != llmColor {
 		t.Fatalf("truncated frame changed the ring to %v", got)
 	}
 }
@@ -292,7 +292,7 @@ func TestReleaseRestoresStaticFirmwareFrame(t *testing.T) {
 	r := newTestRing(t, 1, config(10000, 60000), m)
 	setLED(t, r, 0, alicePurple)
 	r.Route("a", "llm")
-	eventually(t, "recolor", func() bool { return ledValue(t, r, 0) == claude })
+	eventually(t, "recolor", func() bool { return ledValue(t, r, 0) == llmColor })
 	r.Route("b", "yandex")
 	eventually(t, "release", func() bool { return m.mounted() == 0 })
 	if got := ledValue(t, r, 0); got != alicePurple {
@@ -315,7 +315,7 @@ func TestColorChangeKeepsTakeoverAndReleaseAllowsNext(t *testing.T) {
 	r := newTestRing(t, 6, config(10000, 60000), m)
 	setLED(t, r, 0, alicePurple)
 	r.Route("a", "llm")
-	eventually(t, "claude", func() bool { return ledValue(t, r, 0) == claude })
+	eventually(t, "claude", func() bool { return ledValue(t, r, 0) == llmColor })
 	r.Route("b", "home")
 	eventually(t, "home", func() bool { return ledValue(t, r, 0) == homeBlue })
 	if m.bindCount() != 18 {
@@ -520,7 +520,7 @@ func TestFramebufferTakeoverRecolorsFirmwareFrameAndAttachesTriggersBack(t *test
 	r.Route("a", "llm")
 	eventually(t, "triggers detached", func() bool { return allTriggers(t, r, "none") })
 	eventually(t, "recolor", func() bool {
-		return ledValue(t, r, 0) == claude && ledValue(t, r, 1) == [3]int{109, 60, 44} && ledValue(t, r, 2) == [3]int{}
+		return ledValue(t, r, 0) == llmColor && ledValue(t, r, 1) == [3]int{128, 40, 0} && ledValue(t, r, 2) == [3]int{}
 	})
 	if m.bindCount() != 0 {
 		t.Fatalf("binds = %d; the framebuffer mode must not mount stand-ins", m.bindCount())
@@ -539,7 +539,7 @@ func TestFramebufferKeepsKernelDimming(t *testing.T) {
 	setLED(t, r, 0, [3]int{0, 0, 100})
 	r.Route("a", "llm")
 	eventually(t, "dimmed recolor", func() bool {
-		return ledValue(t, r, 0) == [3]int{85, 47, 34}
+		return ledValue(t, r, 0) == [3]int{100, 31, 0}
 	})
 }
 
@@ -548,7 +548,7 @@ func TestFramebufferWithOtherPixelCountUsesWholeFrame(t *testing.T) {
 	drawFramebuffer(t, fb, [3]byte{}, [3]byte{}, [3]byte{}, [3]byte{}, [3]byte{}, [3]byte{255, 255, 255})
 	r.Route("a", "llm")
 	eventually(t, "every zone lit", func() bool {
-		return ledValue(t, r, 0) == claude && ledValue(t, r, 2) == claude
+		return ledValue(t, r, 0) == llmColor && ledValue(t, r, 2) == llmColor
 	})
 }
 
@@ -631,7 +631,7 @@ func TestMini2TriggerListKeepsSysfsMode(t *testing.T) {
 	setLED(t, r, 0, alicePurple)
 	r.Route("a", "llm")
 	eventually(t, "takeover by stand-ins", func() bool { return m.mounted() == 18 })
-	eventually(t, "recolor", func() bool { return ledValue(t, r, 0) == claude })
+	eventually(t, "recolor", func() bool { return ledValue(t, r, 0) == llmColor })
 }
 
 func TestDetachedFramebufferRingIsStillRecognized(t *testing.T) {
@@ -647,7 +647,7 @@ func TestDetachedFramebufferRingIsStillRecognized(t *testing.T) {
 	defer r.Off()
 	drawFramebuffer(t, fb, [3]byte{255, 0, 0}, [3]byte{}, [3]byte{})
 	r.Route("a", "llm")
-	eventually(t, "recolor", func() bool { return ledValue(t, r, 0) == claude })
+	eventually(t, "recolor", func() bool { return ledValue(t, r, 0) == llmColor })
 	drawFramebuffer(t, fb, [3]byte{}, [3]byte{}, [3]byte{})
 	eventually(t, "framebuffer trigger attached", func() bool { return allTriggers(t, r, "led_ring_fb") })
 	if m.bindCount() != 0 {
@@ -699,5 +699,5 @@ func TestScaleHasFloor(t *testing.T) {
 	drawFramebuffer(t, fb, [3]byte{255, 0, 0}, [3]byte{255, 0, 0}, [3]byte{255, 0, 0})
 	setLED(t, r, 0, [3]int{0, 0, 1})
 	r.Route("a", "llm")
-	eventually(t, "floor brightness", func() bool { return ledValue(t, r, 0) == [3]int{11, 6, 4} })
+	eventually(t, "floor brightness", func() bool { return ledValue(t, r, 0) == [3]int{13, 4, 0} })
 }
