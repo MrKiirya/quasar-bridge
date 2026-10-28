@@ -11,3 +11,5 @@
 | Версия сборки `<версия upstream>+mrkiirya.<N>`, N — номер запуска Actions (`build-yap.py --suffix`) | форк | — |
 
 Сборка `.yap`: Actions → release → Run workflow, артефакт `yap-release`.
+
+Ссылки на описание каждой доработки в `docs/guide.md` — в начале [README](README.md).
