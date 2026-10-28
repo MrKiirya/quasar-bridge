@@ -701,3 +701,42 @@ func TestScaleHasFloor(t *testing.T) {
 	r.Route("a", "llm")
 	eventually(t, "floor brightness", func() bool { return ledValue(t, r, 0) == [3]int{13, 4, 0} })
 }
+
+func TestUnsupportedSpeakersAreLeftAlone(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Enabled = true
+	// Station 2: no ring LEDs, a framebuffer for the LED screen.
+	root := filepath.Join(t.TempDir(), "leds")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	screen := filepath.Join(filepath.Dir(root), "graphics", "fb0")
+	if err := os.MkdirAll(screen, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for name, value := range map[string]string{"name": "YNDX LED screen\n", "virtual_size": "89,1\n", "bits_per_pixel": "24\n"} {
+		if err := os.WriteFile(filepath.Join(screen, name), []byte(value), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if r, err := newRing(cfg, root, t.TempDir(), newMounter(), steady); r != nil || err != nil {
+		t.Fatalf("LED screen speaker: %v, %v; want no ring and no error", r, err)
+	}
+	// Street, Hub: other LEDs, no ring.
+	logo := filepath.Join(root, "mango:red:logo0")
+	if err := os.MkdirAll(logo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(logo, "trigger"), []byte("none [ledfb-logo]\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	m := newMounter()
+	standIns := t.TempDir()
+	if r, err := newRing(cfg, root, standIns, m, steady); r != nil || err != nil {
+		t.Fatalf("speaker without ring: %v, %v", r, err)
+	}
+	cleanup(root, standIns, m)
+	if m.unbinds != 0 || activeTrigger(filepath.Join(logo, "trigger")) != "ledfb-logo" {
+		t.Fatalf("cleanup touched a speaker without ring: unbinds = %d", m.unbinds)
+	}
+}
