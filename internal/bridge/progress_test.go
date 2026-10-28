@@ -154,6 +154,12 @@ func testSlowLocalRequest(t *testing.T, finalStream uint32, omitID, voice, shoul
 		if f.Kind() != "TtsGenerate" || f.Client.GetEvent().GetTtsGenerate().GetText() != "Готовый ответ" || f.Client.GetEvent().GetHeader().GetMessageId() == firstTTS.Client.GetEvent().GetHeader().GetMessageId() {
 			t.Fatalf("unexpected up=%s", f.Kind())
 		}
+		n.mu.Lock()
+		armed := n.listening == "slow-request"
+		n.mu.Unlock()
+		if armed != shouldListen {
+			t.Fatalf("final answer armed conversation=%v, want %v", armed, shouldListen)
+		}
 		feedSpeech(t, n, f.Client.GetEvent().GetHeader().GetMessageId(), finalStream, omitID)
 		for {
 			out := next()

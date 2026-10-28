@@ -56,6 +56,7 @@ type config struct {
 	LLMTTSMarkup       bool                 `json:"llm_tts_markup"`
 	HomeWarmArea       string               `json:"home_warm_area"`
 	ListenAfterReply   bool                 `json:"listen_after_reply"`
+	LLMConversation    bool                 `json:"llm_conversation"`
 	Routing            bridge.RoutingConfig `json:"routing"`
 	RouteIndicator     indicator.Config     `json:"route_indicator"`
 }
@@ -230,6 +231,9 @@ func parseConfig(raw []byte, modelOptional bool) (config, error) {
 	}
 	if err := cfg.RouteIndicator.Validate(); err != nil {
 		return cfg, err
+	}
+	if cfg.LLMConversation && !cfg.ListenAfterReply {
+		return cfg, errors.New("llm_conversation requires listen_after_reply")
 	}
 	if _, err := bridge.CompileRouting(cfg.Routing); err != nil {
 		return cfg, err
