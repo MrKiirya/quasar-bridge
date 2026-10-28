@@ -65,7 +65,8 @@ func (m *fakeMounter) bindCount() int {
 // fakeLEDs creates sysfs-like brightness files for zones 1..n under a temp root.
 func fakeLEDs(t *testing.T, prefix string, n int) string {
 	t.Helper()
-	root := t.TempDir()
+	// The LED class sits in its own directory, so a ring framebuffer can be added next to it.
+	root := filepath.Join(t.TempDir(), "leds")
 	for i := 1; i <= n; i++ {
 		for _, c := range []string{"red", "green", "blue"} {
 			dir := filepath.Join(root, prefix+":"+c+":ring"+strconv.Itoa(i))
@@ -229,7 +230,7 @@ func TestCleanupRunsWithoutRing(t *testing.T) {
 	root := fakeLEDs(t, "mini2", 2)
 	blue := filepath.Join(root, "mini2:blue:ring2", "brightness")
 	m.bound[blue] = 2
-	cleanup(root, m)
+	cleanup(root, t.TempDir(), m)
 	if m.mounted() != 0 {
 		t.Fatalf("%d stand-ins left after cleanup", m.mounted())
 	}
@@ -423,5 +424,181 @@ func TestRingBreathesWhileFirmwareHoldsSteadyFrame(t *testing.T) {
 	}
 	if len(seen) < 10 {
 		t.Fatalf("red channel took %d distinct values over one breath; the ring looks flat", len(seen))
+	}
+}
+
+// fakeFramebufferRing builds a Lite 2-like ring: sysfs LEDs that follow a kernel trigger fed by a ring framebuffer.
+func fakeFramebufferRing(t *testing.T, zones, pixels int) (root string, fb string) {
+	t.Helper()
+	root = fakeLEDs(t, "plum", zones)
+	for i := 1; i <= zones; i++ {
+		for _, c := range []string{"red", "green", "blue"} {
+			path := filepath.Join(root, "plum:"+c+":ring"+strconv.Itoa(i), "trigger")
+			if err := os.WriteFile(path, []byte("none timer [led_ring_fb] default-on\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	graphics := filepath.Join(filepath.Dir(root), "graphics", "fb0")
+	if err := os.MkdirAll(graphics, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for name, value := range map[string]string{"name": "YNDX LED ring\n", "virtual_size": strconv.Itoa(pixels) + ",1\n", "bits_per_pixel": "24\n"} {
+		if err := os.WriteFile(filepath.Join(graphics, name), []byte(value), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	dev := t.TempDir()
+	previous := devDir
+	devDir = dev
+	t.Cleanup(func() { devDir = previous })
+	fb = filepath.Join(dev, "fb0")
+	if err := os.WriteFile(fb, make([]byte, pixels*3), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return root, fb
+}
+
+func newFramebufferRing(t *testing.T, zones, pixels int, cfg Config, m *fakeMounter) (*Ring, string) {
+	t.Helper()
+	root, fb := fakeFramebufferRing(t, zones, pixels)
+	cfg.Enabled = true
+	r, err := newRing(cfg, root, t.TempDir(), m, steady)
+	if err != nil || r == nil {
+		t.Fatalf("newRing = %v, %v", r, err)
+	}
+	t.Cleanup(r.Off)
+	return r, fb
+}
+
+// drawFramebuffer plays the firmware drawing BGR pixels into the ring framebuffer.
+func drawFramebuffer(t *testing.T, fb string, pixels ...[3]byte) {
+	t.Helper()
+	var frame []byte
+	for _, p := range pixels {
+		frame = append(frame, p[:]...)
+	}
+	if err := os.WriteFile(fb, frame, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func triggers(t *testing.T, r *Ring) []string {
+	t.Helper()
+	var out []string
+	for _, z := range r.zones {
+		for _, c := range z {
+			out = append(out, activeTrigger(triggerPath(c)))
+		}
+	}
+	return out
+}
+
+func allTriggers(t *testing.T, r *Ring, want string) bool {
+	for _, got := range triggers(t, r) {
+		if got != want {
+			return false
+		}
+	}
+	return true
+}
+
+func TestFramebufferModeIsDetectedByTrigger(t *testing.T) {
+	r, _ := newFramebufferRing(t, 3, 3, config(600, 60000), newMounter())
+	if r.Mode() != "framebuffer" || r.Zones() != 3 {
+		t.Fatalf("mode = %s, zones = %d", r.Mode(), r.Zones())
+	}
+	if m := newTestRing(t, 6, config(600, 60000), newMounter()); m.Mode() != "sysfs" {
+		t.Fatalf("Mini 2 ring mode = %s", m.Mode())
+	}
+}
+
+func TestFramebufferTakeoverRecolorsFirmwareFrameAndAttachesTriggersBack(t *testing.T) {
+	m := newMounter()
+	r, fb := newFramebufferRing(t, 3, 3, config(300, 60000), m)
+	drawFramebuffer(t, fb, [3]byte{255, 0, 0}, [3]byte{0, 128, 0}, [3]byte{})
+	r.Route("a", "llm")
+	eventually(t, "triggers detached", func() bool { return allTriggers(t, r, "none") })
+	eventually(t, "recolor", func() bool {
+		return ledValue(t, r, 0) == claude && ledValue(t, r, 1) == [3]int{109, 60, 44} && ledValue(t, r, 2) == [3]int{}
+	})
+	if m.bindCount() != 0 {
+		t.Fatalf("binds = %d; the framebuffer mode must not mount stand-ins", m.bindCount())
+	}
+	drawFramebuffer(t, fb, [3]byte{}, [3]byte{}, [3]byte{})
+	eventually(t, "triggers attached again", func() bool { return allTriggers(t, r, "led_ring_fb") })
+	if _, err := os.Stat(r.state); !os.IsNotExist(err) {
+		t.Fatalf("trigger state left after release: %v", err)
+	}
+}
+
+func TestFramebufferKeepsKernelDimming(t *testing.T) {
+	r, fb := newFramebufferRing(t, 3, 3, config(10000, 60000), newMounter())
+	// The kernel showed the firmware's 200 as 100 on the LEDs, e.g. in a dark room.
+	drawFramebuffer(t, fb, [3]byte{200, 0, 0}, [3]byte{200, 0, 0}, [3]byte{200, 0, 0})
+	setLED(t, r, 0, [3]int{0, 0, 100})
+	r.Route("a", "llm")
+	eventually(t, "dimmed recolor", func() bool {
+		return ledValue(t, r, 0) == [3]int{85, 47, 34}
+	})
+}
+
+func TestFramebufferWithOtherPixelCountUsesWholeFrame(t *testing.T) {
+	r, fb := newFramebufferRing(t, 3, 6, config(10000, 60000), newMounter())
+	drawFramebuffer(t, fb, [3]byte{}, [3]byte{}, [3]byte{}, [3]byte{}, [3]byte{}, [3]byte{255, 255, 255})
+	r.Route("a", "llm")
+	eventually(t, "every zone lit", func() bool {
+		return ledValue(t, r, 0) == claude && ledValue(t, r, 2) == claude
+	})
+}
+
+func TestCleanupAttachesTriggersAfterCrash(t *testing.T) {
+	root, fb := fakeFramebufferRing(t, 3, 3)
+	drawFramebuffer(t, fb, [3]byte{255, 0, 0}, [3]byte{}, [3]byte{})
+	standIns := t.TempDir()
+	cfg := config(10000, 60000)
+	cfg.Enabled = true
+	r, err := newRing(cfg, root, standIns, newMounter(), steady)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Route("a", "llm")
+	eventually(t, "takeover", func() bool { return allTriggers(t, r, "none") })
+	// A killed run never releases: only the trigger state remains.
+	state, _ := os.ReadFile(r.state)
+	r.closeFiles()
+	cleanup(root, standIns, newMounter())
+	if len(state) == 0 || !allTriggers(t, r, "led_ring_fb") {
+		t.Fatalf("triggers after cleanup = %v", triggers(t, r))
+	}
+	if _, err := os.Stat(filepath.Join(standIns, triggerState)); !os.IsNotExist(err) {
+		t.Fatal("trigger state kept after cleanup")
+	}
+}
+
+func TestTriggerWithoutFramebufferIsRejected(t *testing.T) {
+	root, _ := fakeFramebufferRing(t, 3, 3)
+	if err := os.RemoveAll(filepath.Join(filepath.Dir(root), "graphics")); err != nil {
+		t.Fatal(err)
+	}
+	cfg := DefaultConfig()
+	cfg.Enabled = true
+	if r, err := newRing(cfg, root, t.TempDir(), newMounter(), steady); r != nil || err == nil {
+		t.Fatalf("newRing = %v, %v; want an error", r, err)
+	}
+}
+
+func TestFramebufferOnlyRingIsReported(t *testing.T) {
+	root, _ := fakeFramebufferRing(t, 1, 6)
+	if err := os.RemoveAll(root); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfg := DefaultConfig()
+	cfg.Enabled = true
+	if r, err := newRing(cfg, root, t.TempDir(), newMounter(), steady); r != nil || err == nil {
+		t.Fatalf("newRing = %v, %v; want unsupported", r, err)
 	}
 }
