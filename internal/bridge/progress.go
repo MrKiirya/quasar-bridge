@@ -141,6 +141,9 @@ func (n *Native) deferredPart(p *nativeRequest, text string, last bool) error {
 		return err
 	}
 	n.captureDelivered(p, text, last, len(base.Directives) > 0, true)
+	if last {
+		n.armConversation(p, base.ShouldListen)
+	}
 	return nil
 }
 func (n *Native) finishDeferred(p *nativeRequest, text string) error {
