@@ -126,7 +126,6 @@ type playedAnswer struct {
 // it: the speaker reports the answer played about 50 ms before listening again,
 // while a stock wake word after the answer comes seconds later or interrupts it.
 const followGap = time.Second
-}
 
 func NewNative(ctx context.Context, up, down Sender, resolver Resolver) *Native {
 	ctx, cancel := context.WithCancel(ctx)
