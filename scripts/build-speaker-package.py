@@ -25,10 +25,14 @@ def check_elf(path, arch):
 
 
 def build(arch="arm64", output=None, binary=None, tag=None, upx=False,
-          pcm_armv7_binary=None, pcm_arm64_binary=None):
+          pcm_armv7_binary=None, pcm_arm64_binary=None, version=None):
     if tag is not None and not re.fullmatch(r"v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)", tag):
         raise ValueError("release tag must be vMAJOR.MINOR.PATCH")
-    version = tag[1:] if tag else "dev"
+    if tag is not None and version is not None:
+        raise ValueError("--version is for fork builds without a release tag")
+    # A fork build carries the upstream version plus build metadata; the
+    # updater treats it as a development build and never replaces it.
+    version = tag[1:] if tag else (version or "dev")
     output = Path(output or ROOT / f"dist/quasar-bridge-linux-{arch}.tar.gz").resolve()
     with tempfile.TemporaryDirectory(prefix="quasar-speaker-") as tmp:
         executable = Path(binary).resolve() if binary else Path(tmp) / "quasar-bridge"
@@ -105,6 +109,7 @@ if __name__ == "__main__":
     parser.add_argument("--tag", help="stable release tag; otherwise build a dev archive")
     parser.add_argument("--upx", action="store_true",
                         help="compress with UPX -6 --no-lzma and verify before packaging")
+    parser.add_argument("--version", help="fork build version instead of a release tag, e.g. 0.8.0+mrkiirya.12")
     args = parser.parse_args()
     build(args.arch, args.output, args.binary, args.tag, args.upx,
-          args.pcm_armv7_binary, args.pcm_arm64_binary)
+          args.pcm_armv7_binary, args.pcm_arm64_binary, args.version)
