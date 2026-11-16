@@ -6,9 +6,9 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
-	header "github.com/freequasar/quasar-go-genproto/proto/alice/protos/api/alicekit/events/common/event_header"
-	stat "github.com/freequasar/quasar-go-genproto/proto/alice/protos/api/alicekit/events/request_stat"
-	client "github.com/freequasar/quasar-go-genproto/proto/alice/protos/api/alicekit/protocol/client"
+	header "github.com/skrashevich/quasar-go-genproto/proto/alice/protos/api/alicekit/events/common/event_header"
+	stat "github.com/skrashevich/quasar-go-genproto/proto/alice/protos/api/alicekit/events/request_stat"
+	client "github.com/skrashevich/quasar-go-genproto/proto/alice/protos/api/alicekit/protocol/client"
 
 	"quasarbridge/internal/wire"
 )
