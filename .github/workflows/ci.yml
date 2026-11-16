@@ -109,7 +109,9 @@ jobs:
           else
             # Fork builds carry the upstream version and the run number; the
             # upstream self-update leaves such a version alone.
-            base=$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null || echo v0.0.0)
+            # The fork does not carry upstream tags; borrow them for git describe.
+            git fetch --quiet --tags https://github.com/skrashevich/quasar-bridge
+            base=$(git describe --tags --abbrev=0 --match 'v*')
             python3 scripts/build-speaker-package.py --arch "$PACKAGE_ARCH" --upx --version "${base#v}+mrkiirya.$GITHUB_RUN_NUMBER"
           fi
       - name: Keep speaker release assets
