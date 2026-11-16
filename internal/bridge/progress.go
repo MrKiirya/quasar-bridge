@@ -6,13 +6,14 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
-	directive "github.com/freequasar/quasar-go-genproto/proto/alice/protos/api/alicekit/directives"
-	response "github.com/freequasar/quasar-go-genproto/proto/alice/protos/api/alicekit/events/alice_response"
-	header "github.com/freequasar/quasar-go-genproto/proto/alice/protos/api/alicekit/events/common/event_header"
-	stream "github.com/freequasar/quasar-go-genproto/proto/alice/protos/api/alicekit/events/stream_control"
-	server "github.com/freequasar/quasar-go-genproto/proto/alice/protos/api/alicekit/protocol/server"
-	deferred "github.com/freequasar/quasar-go-genproto/proto/alice/protos/api/alicekit/streaming"
+	directive "github.com/skrashevich/quasar-go-genproto/proto/alice/protos/api/alicekit/directives"
+	response "github.com/skrashevich/quasar-go-genproto/proto/alice/protos/api/alicekit/events/alice_response"
+	header "github.com/skrashevich/quasar-go-genproto/proto/alice/protos/api/alicekit/events/common/event_header"
+	stream "github.com/skrashevich/quasar-go-genproto/proto/alice/protos/api/alicekit/events/stream_control"
+	server "github.com/skrashevich/quasar-go-genproto/proto/alice/protos/api/alicekit/protocol/server"
+	deferred "github.com/skrashevich/quasar-go-genproto/proto/alice/protos/api/alicekit/streaming"
 	"google.golang.org/protobuf/encoding/protowire"
+	"quasarbridge/internal/reply"
 	"quasarbridge/internal/wire"
 )
 
@@ -74,7 +75,7 @@ func (n *Native) progress(p *nativeRequest) func() {
 			case <-p.ctx.Done():
 				return
 			case <-ticker.C:
-				if err := n.deferredPart(p, "", false); err != nil {
+				if err := n.deferredPart(p, "", "", false); err != nil {
 					p.cancel()
 					return
 				}
@@ -93,7 +94,7 @@ func (n *Native) beginDeferred(p *nativeRequest) error {
 	r := &response.TAliceResponseProto{Header: &response.TAliceResponseProto_THeader{RequestId: new(p.applicationID()), ResponseId: new(p.responseID), DialogId: new(p.request.GetHeader().GetDialogId()), SequenceNumber: new(p.request.GetHeader().GetSequenceNumber())}, VoiceResponse: &response.TAliceResponseProto_TVoiceResponse{HasVoiceResponse: true, OutputSpeech: &response.TAliceResponseProto_TVoiceResponse_TOutputSpeech{Text: new("")}}, Response: &response.TAliceResponseProto_TResponse{IsStreaming: true, Directives: []*directive.TDirective{{Type: "client_action", Name: "tts_play_placeholder"}}}}
 	// Station schedules post-speech listening from the initial stream envelope.
 	// Only retry is guaranteed informational; other routes may start silent media.
-	r.VoiceResponse.ShouldListen = n.ShouldListen && p.listenOnStreamStart
+	r.VoiceResponse.ShouldListen = n.ShouldListen && p.listenOnStreamStart && reply.ListeningAllowed(p.ctx)
 	m := &server.TServerMessage{Message: &server.TServerMessage_Event{Event: &server.TServerMessage_TEvent{Header: &header.TEventHeader{MessageId: newID(), RefMessageId: p.id}, Event: &server.TServerMessage_TEvent_AliceResponse{AliceResponse: r}}}}
 	b, err := (wire.Frame{Server: m, Prefix: []byte("AAPI")}).Marshal()
 	if err != nil {
@@ -102,22 +103,21 @@ func (n *Native) beginDeferred(p *nativeRequest) error {
 	if err := n.down(p.ctx, websocket.MessageBinary, b); err != nil {
 		return err
 	}
-	if err := n.deferredPart(p, "", false); err != nil {
+	if err := n.deferredPart(p, "", "", false); err != nil {
 		return err
 	}
 	// Obtain the provider's actual Opus headers; its speech payload is discarded.
 	return n.synthesize(p, "а")
 }
-func (n *Native) deferredPart(p *nativeRequest, text string, last bool) error {
+func (n *Native) deferredPart(p *nativeRequest, text, voice string, last bool) error {
 	if err := p.ctx.Err(); err != nil {
 		return err
 	}
 	p.partial++
 	base := &deferred.TDeferedAliceResponseProto_TBaseResponse{}
-	voice := text
 	if last {
 		silentPlayback := n.hasSilentPlayback(p)
-		base.ShouldListen = n.ShouldListen && !silentPlayback
+		base.ShouldListen = n.ShouldListen && !silentPlayback && reply.ListeningAllowed(p.ctx)
 		if silentPlayback {
 			voice = ""
 		}
@@ -146,7 +146,7 @@ func (n *Native) deferredPart(p *nativeRequest, text string, last bool) error {
 	}
 	return nil
 }
-func (n *Native) finishDeferred(p *nativeRequest, text string) error {
+func (n *Native) finishDeferred(p *nativeRequest, text, voice, speech string) error {
 	select {
 	case <-p.ctx.Done():
 		return p.ctx.Err()
@@ -156,16 +156,16 @@ func (n *Native) finishDeferred(p *nativeRequest, text string) error {
 		if err := n.finishSilentAudio(p); err != nil {
 			return err
 		}
-		return n.deferredPart(p, text, true)
+		return n.deferredPart(p, text, voice, true)
 	}
 	n.mu.Lock()
 	p.ttsID = newID()
 	n.tts[p.ttsID] = p
 	n.mu.Unlock()
-	if err := n.deferredPart(p, text, true); err != nil {
+	if err := n.deferredPart(p, text, voice, true); err != nil {
 		return err
 	}
-	return n.synthesize(p, text)
+	return n.synthesize(p, speech)
 }
 
 // Content audio must start after the silent Dialog player releases its focus.

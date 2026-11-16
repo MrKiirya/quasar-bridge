@@ -65,6 +65,7 @@ func TestRoutingValidationAndCallerMutation(t *testing.T) {
 		func(c *RoutingConfig) { c.Rules[0].Route = "bad" },
 		func(c *RoutingConfig) { c.Rules[0].Match = RoutingMatch{Regex: "["} },
 		func(c *RoutingConfig) { c.Rules[0].Match = RoutingMatch{} },
+		func(c *RoutingConfig) { c.Rules[0].Match = RoutingMatch{WakeWords: []string{" "}} },
 		func(c *RoutingConfig) { c.Rules[0].Match = RoutingMatch{ContainsAllGroups: [][]string{{}}} },
 		func(c *RoutingConfig) { c.Rules[1].Name = c.Rules[0].Name },
 		func(c *RoutingConfig) { c.DefaultRoute = "bad" },
@@ -229,6 +230,69 @@ func TestShortHistoryRequestsSkipClassifier(t *testing.T) {
 	}
 }
 
+func TestDefaultTTSRequestsRouteToLLMBeforeOtherRules(t *testing.T) {
+	e := &Engine{LLM: completionFunc(func(context.Context, []llm.Message, bool) (string, error) {
+		t.Error("explicit TTS request reached classifier")
+		return `{"route":"yandex"}`, nil
+	})}
+	for _, text := range []string{
+		"Ответь голосом Захара и добавь мяуканье",
+		"Произнесите фразу с эффектом мегафона",
+		"Скажи голосом Оксаны, почему горит свет",
+		"Расскажи сказку другим голосом",
+		"Прочитай через мегафон",
+		"Добавь звук мяуканья в ответ",
+		"Можешь сказать голосом Джейн, который час?",
+		"Какая завтра погода? Ответь голосом Захара.",
+		"Объяви отправление поезда с эффектом вокзального громкоговорителя",
+		"Объяви шепотом отправление поезда",
+		"Объяви шепотом отправление поезда с эффектом вокзального громкоговорителя",
+		"Алиса, пожалуйста, скажи шёпотом, какая завтра погода",
+	} {
+		d := e.Decide(t.Context(), text)
+		if d.Route != "llm" || d.Rule != "tts_markup" || d.Source != "rule" {
+			t.Errorf("%q: %+v", text, d)
+		}
+	}
+}
+
+func TestDefaultNativeWhisperCommandsGoToYandex(t *testing.T) {
+	e := &Engine{LLM: completionFunc(func(context.Context, []llm.Message, bool) (string, error) {
+		t.Error("plain whisper reached classifier")
+		return `{"route":"llm"}`, nil
+	})}
+	for _, text := range []string{
+		"Скажи шепотом",
+		"Алиса, пожалуйста, скажи шёпотом привет",
+		"Скажи что-нибудь шёпотом",
+		"Говори шепотом",
+	} {
+		if d := e.Decide(t.Context(), text); d.Route != "yandex" || d.Rule != "tts_whisper" || d.Source != "rule" {
+			t.Errorf("%q: %+v", text, d)
+		}
+	}
+	if d := e.Decide(t.Context(), "Спроси нейросеть, скажи шёпотом привет"); d.Route != "llm" {
+		t.Errorf("explicit request to use the model: %+v", d)
+	}
+}
+
+func TestDefaultTTSRuleLeavesOtherRequestsToExistingRoutes(t *testing.T) {
+	for _, tc := range []struct{ text, route string }{
+		{"Какие голоса поддерживает Алиса?", "classify"},
+		{"Расскажи, как произнести фразу с эффектом мегафона", "classify"},
+		{"Ответь голосом, какая завтра погода", "yandex"},
+		{"Не отвечай голосом Захара", "classify"},
+		{"Скажи не голосом Захара, какая завтра погода", "yandex"},
+		{"Включи музыку", "yandex"},
+		{"Включи свет", "home"},
+	} {
+		d := builtInRouting.Preview(tc.text, "")
+		if d.Route != tc.route || d.Rule == "tts_markup" {
+			t.Errorf("%q: %+v, want route %s", tc.text, d, tc.route)
+		}
+	}
+}
+
 func TestSpeakerPlaybackControlSkipsClassifier(t *testing.T) {
 	e := &Engine{Home: homeFunc(func(context.Context, string) (string, error) { t.Fatal("speaker control reached home"); return "", nil }), LLM: completionFunc(func(context.Context, []llm.Message, bool) (string, error) {
 		t.Fatal("speaker control reached classifier")
@@ -251,58 +315,18 @@ func TestSpeakerPlaybackControlSkipsClassifier(t *testing.T) {
 	}
 }
 
-func TestRoutingWakeWordAny(t *testing.T) {
-	cfg := DefaultRoutingConfig()
-	cfg.Rules = []RoutingRule{
-		{Name: "comrade", Route: "llm", Match: RoutingMatch{WakeWordAny: []string{"Товарищ"}}},
-		{Name: "comrade-home", Route: "home", Match: RoutingMatch{WakeWordAny: []string{"джарвис"}, ContainsAny: []string{"свет"}}},
-	}
-	cfg.DefaultRoute = "yandex"
-	e := &Engine{Home: homeFunc(func(context.Context, string) (string, error) { return "", nil })}
-	if err := e.SetRouting(cfg); err != nil {
-		t.Fatal(err)
-	}
-	for _, tc := range []struct{ wake, text, route, rule string }{
-		{"", "как дела", "yandex", ""},
-		{"товарищ", "как дела", "llm", "comrade"},
-		{"джарвис", "включи свет", "home", "comrade-home"},
-		{"джарвис", "как дела", "yandex", ""},
-	} {
-		ctx := t.Context()
-		if tc.wake != "" {
-			ctx = WithWakeWord(ctx, tc.wake)
+func TestBridgeUpdateRequestsNeverReachHomeClassifier(t *testing.T) {
+	e := &Engine{Home: homeFunc(func(context.Context, string) (string, error) {
+		t.Fatal("update reached Home Assistant")
+		return "", nil
+	}), LLM: completionFunc(func(context.Context, []llm.Message, bool) (string, error) {
+		t.Error("update request reached classifier")
+		return `{"route":"home"}`, nil
+	})}
+	for _, text := range []string{"Проверь обновления", "Есть ли обновления?", "Алиса, проверь обновления, пожалуйста!", "Спроси нейросеть: проверь обновления", "Проверь обновления Quasar Bridge", "Установи новую версию", "Установи обновления"} {
+		got := e.Decide(t.Context(), text)
+		if got.Route != "llm" || got.Rule != "bridge_updates" {
+			t.Errorf("%q: %+v", text, got)
 		}
-		if got := e.Decide(ctx, tc.text); got.Route != tc.route || got.Rule != tc.rule {
-			t.Errorf("%q/%q: %+v", tc.wake, tc.text, got)
-		}
-	}
-	cfg.Rules = []RoutingRule{{Name: "empty", Route: "llm", Match: RoutingMatch{WakeWordAny: []string{" "}}}}
-	if _, err := CompileRouting(cfg); err == nil {
-		t.Fatal("empty wake word accepted")
-	}
-}
-
-func TestEngineUsesWakeWordFollowsActiveRules(t *testing.T) {
-	cfg := DefaultRoutingConfig()
-	e := new(Engine)
-	if err := e.SetRouting(cfg); err != nil {
-		t.Fatal(err)
-	}
-	if e.UsesWakeWord() {
-		t.Fatal("default rules use the wake word")
-	}
-	cfg.Rules = append(cfg.Rules, RoutingRule{Name: "comrade", Route: "llm", Disabled: true, Match: RoutingMatch{WakeWordAny: []string{"товарищ"}}})
-	if err := e.SetRouting(cfg); err != nil {
-		t.Fatal(err)
-	}
-	if e.UsesWakeWord() {
-		t.Fatal("disabled rule counted")
-	}
-	cfg.Rules[len(cfg.Rules)-1].Disabled = false
-	if err := e.SetRouting(cfg); err != nil {
-		t.Fatal(err)
-	}
-	if !e.UsesWakeWord() {
-		t.Fatal("active rule not counted")
 	}
 }

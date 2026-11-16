@@ -64,9 +64,6 @@ func (c *conversation) route(id, route string) {
 	c.mu.Unlock()
 	c.emit(id, journal.Event{Event: "route"})
 }
-func (c *conversation) wakeWord(id, word string) {
-	c.emit(id, journal.Event{Event: "wake_word", Text: word})
-}
 func (c *conversation) client(data []byte) {
 	if !c.writer.Enabled() {
 		return
@@ -148,7 +145,7 @@ func (c *conversation) server(data []byte, delivered bool) {
 		if d.GetIsLast() {
 			name = "response"
 		}
-		c.emit(id, journal.Event{Event: name, Kind: f.Kind(), Text: d.GetBaseResponse().GetText(), Delivered: delivered})
+		c.emit(id, journal.Event{Event: name, Kind: f.Kind(), Text: d.GetBaseResponse().GetText(), Speech: deferredResponseSpeech(d.GetBaseResponse()), Delivered: delivered})
 	}
 	if r := e.GetAliceResponse(); r != nil {
 		if id == "" {

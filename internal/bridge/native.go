@@ -1,29 +1,33 @@
 package bridge
 
 import (
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/coder/websocket"
-	request "github.com/freequasar/quasar-go-genproto/proto/alice/protos/api/alicekit/events/alice_request"
-	response "github.com/freequasar/quasar-go-genproto/proto/alice/protos/api/alicekit/events/alice_response"
-	cancellation "github.com/freequasar/quasar-go-genproto/proto/alice/protos/api/alicekit/events/cancel_request"
-	header "github.com/freequasar/quasar-go-genproto/proto/alice/protos/api/alicekit/events/common/event_header"
-	continuation "github.com/freequasar/quasar-go-genproto/proto/alice/protos/api/alicekit/events/continue_request"
-	ack "github.com/freequasar/quasar-go-genproto/proto/alice/protos/api/alicekit/events/input_start_ack"
-	tts "github.com/freequasar/quasar-go-genproto/proto/alice/protos/api/alicekit/events/tts_generate"
-	client "github.com/freequasar/quasar-go-genproto/proto/alice/protos/api/alicekit/protocol/client"
-	server "github.com/freequasar/quasar-go-genproto/proto/alice/protos/api/alicekit/protocol/server"
+	request "github.com/skrashevich/quasar-go-genproto/proto/alice/protos/api/alicekit/events/alice_request"
+	response "github.com/skrashevich/quasar-go-genproto/proto/alice/protos/api/alicekit/events/alice_response"
+	asrcommon "github.com/skrashevich/quasar-go-genproto/proto/alice/protos/api/alicekit/events/asr_result/common"
+	cancellation "github.com/skrashevich/quasar-go-genproto/proto/alice/protos/api/alicekit/events/cancel_request"
+	header "github.com/skrashevich/quasar-go-genproto/proto/alice/protos/api/alicekit/events/common/event_header"
+	continuation "github.com/skrashevich/quasar-go-genproto/proto/alice/protos/api/alicekit/events/continue_request"
+	ack "github.com/skrashevich/quasar-go-genproto/proto/alice/protos/api/alicekit/events/input_start_ack"
+	tts "github.com/skrashevich/quasar-go-genproto/proto/alice/protos/api/alicekit/events/tts_generate"
+	client "github.com/skrashevich/quasar-go-genproto/proto/alice/protos/api/alicekit/protocol/client"
+	server "github.com/skrashevich/quasar-go-genproto/proto/alice/protos/api/alicekit/protocol/server"
 	"google.golang.org/protobuf/proto"
 
 	"quasarbridge/internal/dialogue"
+	"quasarbridge/internal/reply"
 	"quasarbridge/internal/sound"
 	"quasarbridge/internal/wire"
 )
@@ -31,6 +35,7 @@ import (
 type Resolution struct {
 	Route  string
 	Answer string
+	speech string // Optional TTS text with markup, separate from the displayed answer.
 }
 type Resolver interface {
 	Resolve(context.Context, string) (Resolution, error)
@@ -44,11 +49,16 @@ type FallbackResolver interface {
 }
 
 type nativeRequest struct {
+	audioInput                      []byte
+	audioInputDone                  bool
+	inputWhisper                    bool
 	streaming                       bool
 	listenOnStreamStart             bool
 	partial                         uint32
 	responseID                      string
 	final                           bool
+	aggregateSeen                   bool
+	aggregateFinalSeen              bool
 	header                          *header.TEventHeader
 	isText                          bool
 	ttsStarted                      bool
@@ -64,6 +74,7 @@ type nativeRequest struct {
 	continuation                    []byte
 	ttsID                           string
 	progressTTS                     string
+	markedTTS                       bool // <speaker> can produce chained Opus streams.
 	audio                           oggSpeech
 	audioIsProgress                 bool
 	audioStarted                    bool
@@ -74,7 +85,6 @@ type nativeRequest struct {
 	soundDirective                  *soundDirective
 	soundSealed                     bool
 	expires                         *time.Timer
-	wake                            chan string
 	failed                          bool
 }
 type Native struct {
@@ -96,10 +106,6 @@ type Native struct {
 	DecisionDelay    time.Duration
 	ProgressAfter    time.Duration
 	ProgressInterval time.Duration
-	// WakeWord names the custom wake word that opened a voice request received at the given time, "" for the stock one.
-	WakeWord func(context.Context, time.Time) string
-	// OnWakeWord is told the custom wake word of a native request, after the journal.
-	OnWakeWord func(id, word string)
 	// KeepConversation keeps the LLM route for a voice request that the speaker
 	// opens on its own right after a fully played LLM answer (listen_after_reply).
 	KeepConversation bool
@@ -121,12 +127,6 @@ type playedAnswer struct {
 // while a stock wake word after the answer comes seconds later or interrupts it.
 const followGap = time.Second
 
-// usesWakeWord reports whether the resolver's current rules read the wake word.
-func usesWakeWord(r Resolver) bool {
-	u, ok := r.(interface{ UsesWakeWord() bool })
-	return ok && u.UsesWakeWord()
-}
-
 func NewNative(ctx context.Context, up, down Sender, resolver Resolver) *Native {
 	ctx, cancel := context.WithCancel(ctx)
 	return &Native{connectionScope: newID(), ctx: ctx, cancel: cancel, up: up, down: down, resolver: resolver, ShouldListen: true, requests: map[string]*nativeRequest{}, tts: map[string]*nativeRequest{}, streams: map[uint32]*nativeRequest{}, blocked: map[uint32]*nativeRequest{}}
@@ -143,6 +143,9 @@ func (n *Native) Close() {
 	n.wg.Wait()
 }
 func (n *Native) Client(ctx context.Context, k websocket.MessageType, data []byte) error {
+	if k == websocket.MessageBinary {
+		n.collectWhisperAudio(data)
+	}
 	f := wire.Decode(data, wire.ClientToServer)
 	if f.Client == nil || f.Client.GetEvent() == nil {
 		return n.up(ctx, k, data)
@@ -194,6 +197,10 @@ func (n *Native) Client(ctx context.Context, k websocket.MessageType, data []byt
 			scope = "uuid:" + id
 		}
 		pctx, cancel := context.WithTimeout(dialogue.WithSpeaker(n.ctx, scope), 90*time.Second)
+		if tag := req.GetEventSource().GetId(); e.GetVoiceInput() != nil && tag != "" {
+			pctx = context.WithValue(pctx, wakewordTagKey{}, tag)
+		}
+		pctx = reply.WithPolicy(pctx)
 		playerState := nativePlaybackState(req)
 		pctx = sound.WithPlaybackState(pctx, playerState)
 		slog.Info("native_player_state", "request", requestTag(id), "present", playerState.Present, "player_state", playerState.PlayerState, "offset_known", playerState.OffsetKnown, "offset_ms", playerState.OffsetMS, "has_stream", playerState.StreamID != "", "stream_tag", requestTag(playerState.StreamID))
@@ -205,10 +212,6 @@ func (n *Native) Client(ctx context.Context, k websocket.MessageType, data []byt
 		p.isText = f.Kind() == "TextInput"
 		p.input = append([]byte{}, data...)
 		p.gated = !p.isText || n.GateText
-		received := time.Now()
-		if !p.isText && n.WakeWord != nil && usesWakeWord(n.resolver) {
-			p.wake = make(chan string, 1)
-		}
 
 		slog.Info("native_request_shape", "request", requestTag(id), "text_bytes", len(p.text), "event_type", req.GetRequest().GetEvent().GetType().String(), "stream", e.GetHeader().GetStreamId(), "unknown_request_bytes", len(req.ProtoReflect().GetUnknown()), "payload_bytes", len(req.GetRequest().GetEvent().GetPayloadRaw()))
 		n.mu.Lock()
@@ -247,6 +250,7 @@ func (n *Native) Client(ctx context.Context, k websocket.MessageType, data []byt
 			}
 		})
 		n.requests[id] = p
+		received := time.Now()
 		if n.KeepConversation && n.listening != "" {
 			switch {
 			case p.isText:
@@ -267,10 +271,6 @@ func (n *Native) Client(ctx context.Context, k websocket.MessageType, data []byt
 			n.OnStart(id)
 		}
 		n.mu.Unlock()
-		if p.wake != nil {
-			// Ask now, while the request is still being recognized.
-			n.wg.Go(func() { p.wake <- n.WakeWord(pctx, received) })
-		}
 		if p.gated {
 			gated, err := wire.EnableApproval(f)
 			if err != nil {
@@ -347,7 +347,7 @@ func (n *Native) Server(ctx context.Context, k websocket.MessageType, data []byt
 			n.mu.Lock()
 			p := n.streams[binary.BigEndian.Uint32(data)]
 			drop := n.blocked[binary.BigEndian.Uint32(data)] != nil || (p != nil && p.canceled)
-			if p != nil && p.streaming && !drop {
+			if p != nil && (p.streaming || p.markedTTS) && !drop {
 				out, err := p.audio.feed(data[4:])
 				if err == nil && len(out) > 0 {
 					err = n.down(ctx, k, append(binary.BigEndian.AppendUint32(nil, p.audioStream), out...))
@@ -385,7 +385,7 @@ func (n *Native) Server(ctx context.Context, k websocket.MessageType, data []byt
 				n.mu.Unlock()
 				return nil
 			}
-			if p.streaming && sc.GetClose() != nil {
+			if (p.streaming || p.markedTTS) && sc.GetClose() != nil {
 				if err := p.audio.endSource(); err != nil {
 					p.cancel()
 					n.mu.Unlock()
@@ -414,12 +414,17 @@ func (n *Native) Server(ctx context.Context, k websocket.MessageType, data []byt
 				sc.StreamId = int64(p.audioStream)
 			}
 			sc.MessageId = p.id
+			finalSpeech := sc.GetClose() != nil && (!p.streaming || !p.audioIsProgress)
 			n.mu.Unlock()
 			out, err := f.Marshal()
 			if err != nil {
 				return err
 			}
-			return n.down(ctx, k, out)
+			err = n.down(ctx, k, out)
+			if err == nil && finalSpeech {
+				reply.Delivered(p.ctx)
+			}
+			return err
 		}
 		drop := original != nil && original.local && (original.header.StreamId == nil || sc.GetStreamId() != original.header.GetStreamId())
 		n.mu.Unlock()
@@ -463,11 +468,11 @@ func (n *Native) Server(ctx context.Context, k websocket.MessageType, data []byt
 		}
 		if e.GetTtsSpeak() != nil {
 			n.streams[uint32(e.Header.GetStreamId())] = p
-			if p.streaming {
+			if p.streaming || p.markedTTS {
 				if e.GetTtsSpeak().GetFormat() != "audio/opus" {
 					p.cancel()
 					n.mu.Unlock()
-					return errors.New("streaming progress requires Opus")
+					return errors.New("joining speech segments requires Opus")
 				}
 				p.audioIsProgress = p.ttsID == p.progressTTS
 				p.audio.next()
@@ -536,7 +541,7 @@ func (n *Native) Server(ctx context.Context, k websocket.MessageType, data []byt
 					n.mu.Unlock()
 				}
 				_ = n.sendCancel(p.ctx, p.id)
-				if err := n.reply(p, result.Answer); err != nil {
+				if err := n.reply(p, result); err != nil {
 					slog.Warn("native_reply_failed", "request", requestTag(p.id))
 				}
 				slog.Info("native_fallback", "request", requestTag(p.id), "route", "llm")
@@ -544,6 +549,7 @@ func (n *Native) Server(ctx context.Context, k websocket.MessageType, data []byt
 			return nil
 		}
 	}
+	emptyFinal := false
 	switch f.Kind() {
 	case "AliceResponse":
 		if !p.cloud {
@@ -555,9 +561,15 @@ func (n *Native) Server(ctx context.Context, k websocket.MessageType, data []byt
 		slog.Info("native_server_ready", "request", requestTag(p.id))
 	case "AsrResult":
 		asr := e.GetAsrResult()
+		aggregate := asr.GetAggregatedRecognition()
+		if aggregate != nil && (!p.aggregateSeen || (aggregate.GetIsFinal() && !p.aggregateFinalSeen)) {
+			p.aggregateSeen = true
+			p.aggregateFinalSeen = p.aggregateFinalSeen || aggregate.GetIsFinal()
+			slog.Info("native_asr_aggregate", "request", requestTag(p.id), "end_of_utt", asr.GetEndOfUtt(), "aggregate_present", true, "aggregate_final", aggregate.GetIsFinal(), "aggregate_index", aggregate.GetIndex(), "aggregate_text_bytes", len(aggregate.GetRecognizedText()))
+		}
 		if asr.GetEndOfUtt() {
 			p.final = true
-			slog.Info("native_asr_final", "request", requestTag(p.id), "hypotheses", len(asr.GetRecognition()), "code", asr.GetResponseCode().String())
+			slog.Info("native_asr_final", "request", requestTag(p.id), "hypotheses", len(asr.GetRecognition()), "code", asr.GetResponseCode().String(), "aggregate_present", aggregate != nil, "aggregate_final", aggregate.GetIsFinal(), "aggregate_index", aggregate.GetIndex(), "aggregate_text_bytes", len(aggregate.GetRecognizedText()))
 		}
 		if asr.GetEndOfUtt() && len(asr.GetRecognition()) > 0 {
 			r := asr.GetRecognition()[0]
@@ -570,9 +582,15 @@ func (n *Native) Server(ctx context.Context, k websocket.MessageType, data []byt
 				p.text = strings.Join(words, " ")
 			}
 		}
+		emptyFinal = !p.started && asr.GetEndOfUtt() && asr.GetResponseCode() == asrcommon.EAsrResponseCode_OK && strings.TrimSpace(p.text) == ""
 
 	}
 	n.mu.Unlock()
+	if emptyFinal {
+		if listener, ok := n.resolver.(interface{ EmptyInput(context.Context) }); ok {
+			listener.EmptyInput(p.ctx)
+		}
+	}
 	n.maybeResolve(p)
 	if err := n.down(ctx, k, data); err != nil {
 		return err
@@ -587,22 +605,24 @@ func (n *Native) maybeResolve(p *nativeRequest) {
 		return
 	}
 	p.started = true
+	audioInput := p.audioInput
+	p.audioInput = nil
+	p.audioInputDone = true
 	text := p.text
-	ctx := p.ctx
 	n.mu.Unlock()
 	n.wg.Go(func() {
-		if p.wake != nil {
-			select {
-			case word := <-p.wake:
-				if word != "" {
-					ctx = WithWakeWord(ctx, word)
-					slog.Info("native_wake_word", "request", requestTag(p.id), "word", WakeWord(ctx))
-					if n.OnWakeWord != nil {
-						n.OnWakeWord(p.id, WakeWord(ctx))
-					}
-				}
-			case <-ctx.Done():
-				return
+		if os.Getenv("QUASAR_AUTO_WHISPER") == "1" && strings.TrimSpace(text) != "" && len(audioInput) > 0 {
+			inputBytes := len(audioInput)
+			pcm, err := decodeWhisperOpus(audioInput)
+			audioInput = nil
+			if err == nil {
+				m := acousticWhisper(pcm)
+				n.mu.Lock()
+				p.inputWhisper = m.Whisper
+				n.mu.Unlock()
+				slog.Info("acoustic_whisper", "request", requestTag(p.id), "whisper", m.Whisper, "active_frames", m.Active, "zcr", m.ZCR, "periodicity", m.Periodicity, "voiced_fraction", m.Voiced)
+			} else {
+				slog.Info("acoustic_whisper_unavailable", "request", requestTag(p.id), "audio_bytes", inputBytes, "reason", err.Error())
 			}
 		}
 		if n.DecisionDelay > 0 {
@@ -616,7 +636,7 @@ func (n *Native) maybeResolve(p *nativeRequest) {
 		var err error
 		if n.resolver != nil && strings.TrimSpace(text) != "" {
 			if routed, ok := n.resolver.(RoutedResolver); ok {
-				decision := routed.Decide(ctx, text)
+				decision := routed.Decide(p.ctx, text)
 				n.mu.Lock()
 				p.listenOnStreamStart = decision.Source == "dialogue_retry"
 				n.mu.Unlock()
@@ -625,10 +645,10 @@ func (n *Native) maybeResolve(p *nativeRequest) {
 				if decision.Route != "yandex" && n.ProgressAfter > 0 {
 					stop = n.progress(p)
 				}
-				result, err = routed.ResolveDecision(ctx, text, decision)
+				result, err = routed.ResolveDecision(p.ctx, text, decision)
 				stop()
 			} else {
-				result, err = n.resolver.Resolve(ctx, text)
+				result, err = n.resolver.Resolve(p.ctx, text)
 			}
 		}
 		if p.ctx.Err() != nil {
@@ -640,9 +660,18 @@ func (n *Native) maybeResolve(p *nativeRequest) {
 		}
 		if err != nil {
 			n.discardSound(p)
-			if result.Route == "home" {
+			if result.Route == "recovery" {
+				slog.Warn("native_recovery_failed", "request", requestTag(p.id), "error", err)
+				result.Answer = "Не удалось запланировать аварийное восстановление. Проверьте журнал Quasar Bridge и выполните восстановление по SSH."
+			} else if result.Route == "diagnostics" {
+				slog.Warn("native_diagnostics_failed", "request", requestTag(p.id), "error", err)
+				result.Answer = "Не удалось изменить сетевой доступ к веб-интерфейсу. Проверьте журнал Quasar Bridge."
+			} else if result.Route == "home" {
 				result.Answer = "Не удалось подтвердить выполнение команды в умном доме."
+			} else if result.Route == "airplay" {
+				result.Answer = "Не удалось изменить состояние AirPlay. Проверьте журнал Quasar Bridge."
 			} else if result.Route == "music" {
+				slog.Warn("native_music_failed", "request", requestTag(p.id), "error", err)
 				result.Answer = "Не удалось включить музыку с этой страницы."
 			} else {
 				result.Route = "llm"
@@ -692,7 +721,7 @@ func (n *Native) maybeResolve(p *nativeRequest) {
 				return
 			}
 		}
-		if err := n.reply(p, result.Answer); err != nil {
+		if err := n.reply(p, result); err != nil {
 			slog.Warn("native_reply_failed", "request", requestTag(p.id))
 		}
 	})
@@ -705,17 +734,24 @@ func (n *Native) sendCancel(ctx context.Context, id string) error {
 	}
 	return n.up(ctx, websocket.MessageBinary, b)
 }
-func (n *Native) reply(p *nativeRequest, text string) error {
+func (n *Native) reply(p *nativeRequest, result Resolution) error {
+	text := result.Answer
+	voice := text
+	speech := cmp.Or(result.speech, text)
+	if result.Route == "llm" {
+		voice = speechText(voice)
+		speech = speechText(speech)
+	}
 	if p.streaming {
-		return n.finishDeferred(p, text)
+		return n.finishDeferred(p, text, voice, speech)
 	}
 	requestID := p.request.GetHeader().GetRequestId()
 	if requestID == "" {
 		requestID = p.id
 	}
-	answer := &response.TAliceResponseProto{Header: &response.TAliceResponseProto_THeader{RequestId: new(requestID), ResponseId: new(newID()), DialogId: new(p.request.GetHeader().GetDialogId()), SequenceNumber: new(p.request.GetHeader().GetSequenceNumber())}, VoiceResponse: &response.TAliceResponseProto_TVoiceResponse{OutputSpeech: &response.TAliceResponseProto_TVoiceResponse_TOutputSpeech{Text: new(text)}, HasVoiceResponse: true}, Response: &response.TAliceResponseProto_TResponse{Cards: []*response.TAliceResponseProto_TResponse_TCard{{Type: "simple_text", Text: new(text), CardId: new(newID())}}}}
+	answer := &response.TAliceResponseProto{Header: &response.TAliceResponseProto_THeader{RequestId: new(requestID), ResponseId: new(newID()), DialogId: new(p.request.GetHeader().GetDialogId()), SequenceNumber: new(p.request.GetHeader().GetSequenceNumber())}, VoiceResponse: &response.TAliceResponseProto_TVoiceResponse{OutputSpeech: &response.TAliceResponseProto_TVoiceResponse_TOutputSpeech{Text: new(voice)}, HasVoiceResponse: true}, Response: &response.TAliceResponseProto_TResponse{Cards: []*response.TAliceResponseProto_TResponse_TCard{{Type: "simple_text", Text: new(text), CardId: new(newID())}}}}
 	silentPlayback := n.hasSilentPlayback(p)
-	answer.VoiceResponse.ShouldListen = n.ShouldListen && !silentPlayback
+	answer.VoiceResponse.ShouldListen = n.ShouldListen && !silentPlayback && reply.ListeningAllowed(p.ctx)
 	if silentPlayback {
 		answer.VoiceResponse.HasVoiceResponse = false
 		answer.VoiceResponse.OutputSpeech.Text = new("")
@@ -739,7 +775,7 @@ func (n *Native) reply(p *nativeRequest, text string) error {
 	if silentPlayback {
 		return nil
 	}
-	return n.synthesize(p, text)
+	return n.synthesize(p, speech)
 }
 
 // armConversation lets the request the speaker opens after this answer continue
@@ -752,6 +788,15 @@ func (n *Native) armConversation(p *nativeRequest, listen bool) {
 	}
 }
 func (n *Native) synthesize(p *nativeRequest, text string) error {
+	if p.inputWhisper {
+		text = `<speaker is_whisper="true">` + text
+		slog.Info("tts_whisper_enabled", "request", requestTag(p.id))
+	}
+	if strings.Contains(text, "<speaker") {
+		n.mu.Lock()
+		p.markedTTS = true
+		n.mu.Unlock()
+	}
 	t := &client.TClientMessage{Message: &client.TClientMessage_Event{Event: &client.TClientMessage_TEvent{Header: &header.TEventHeader{MessageId: p.ttsID}, Event: &client.TClientMessage_TEvent_TtsGenerate{TtsGenerate: &tts.TTtsGenerate{Text: new(text), Lang: new("ru-RU"), Format: new("audio/opus")}}}}}
 	b, err := (wire.Frame{Client: t, Prefix: []byte("AAPI")}).Marshal()
 	if err != nil {

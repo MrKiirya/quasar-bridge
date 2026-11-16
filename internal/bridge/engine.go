@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json/v2"
 	"errors"
+	"quasarbridge/internal/configvoice"
 	"quasarbridge/internal/dialogue"
 	"strings"
 	"sync"
@@ -12,8 +13,11 @@ import (
 
 	"quasarbridge/internal/llm"
 	"quasarbridge/internal/playback"
+	"quasarbridge/internal/reply"
 	"quasarbridge/internal/webaddress"
 )
+
+const defaultSystemPrompt = "Ты голосовой помощник пользователя. Отвечай по-русски, кратко и по существу, обычно до трёх предложений. Ответ будет прочитан вслух: без Markdown и служебных рассуждений. Выполняй внешние действия только доступными инструментами по явному запросу пользователя. Не заявляй о выполнении действий без успешного результата инструмента; если инструмента нет, прямо скажи об этом. Для Home Assistant есть отдельный обработчик умного дома."
 
 type Completer interface {
 	Complete(context.Context, []llm.Message, bool) (string, error)
@@ -30,15 +34,23 @@ type MusicStarter interface {
 	StartMusic(context.Context, string) (string, error)
 }
 type Engine struct {
-	LLM          Completer
-	Assistant    Completer
-	Home         HomeHandler
-	Playback     PlaybackController
-	Music        MusicStarter
-	Dialogue     *dialogue.Store
-	Prompts      Prompts
-	dialogueOnce sync.Once
-	routing      atomic.Pointer[RoutingPolicy]
+	Configuration bool
+	Recovery      func(context.Context, string) (string, error)
+	SystemPrompt  string
+	Diagnostics   func(context.Context, bool) (string, error)
+	AirPlay       AirPlayController
+	LLM           Completer
+	Assistant     Completer
+	Home          HomeHandler
+	Playback      PlaybackController
+	Music         MusicStarter
+	Dialogue      *dialogue.Store
+	TTSMarkup     bool
+	// StripPrefixes are model addresses removed only from outbound requests.
+	// An empty list disables stripping.
+	StripPrefixes []string
+	dialogueOnce  sync.Once
+	routing       atomic.Pointer[RoutingPolicy]
 }
 
 func (e *Engine) dialogue() *dialogue.Store {
@@ -69,7 +81,7 @@ func (e *Engine) ResolveDecision(ctx context.Context, text string, decision Rout
 	} else {
 		ctx = e.Prepare(ctx)
 	}
-	_, _, ticket := e.dialogue().Start(ctx)
+	ctx, snapshot, ticket := e.dialogue().Start(ctx)
 	if ctx.Err() != nil {
 		return Resolution{Route: route}, ctx.Err()
 	}
@@ -87,11 +99,60 @@ func (e *Engine) ResolveDecision(ctx context.Context, text string, decision Rout
 		}
 		return Resolution{Route: "llm", Answer: "Начинаем новый разговор."}, nil
 	}
-	if route != "llm" && !e.dialogue().Clear(ctx, ticket) {
-		return Resolution{Route: route}, context.Canceled
+	if (route != "llm" && route != "home") || (snapshot.Route != "" && snapshot.Route != route) {
+		if !e.dialogue().Clear(ctx, ticket) {
+			return Resolution{Route: route}, context.Canceled
+		}
+		snapshot = dialogue.Snapshot{}
 	}
 	result := Resolution{Route: route}
 	switch route {
+	case "diagnostics":
+		enabled, ok := configvoice.DiagnosticsCommand(text)
+		if !ok || e.Diagnostics == nil {
+			return result, errors.New("live diagnostics control is unavailable")
+		}
+		answer, err := e.Diagnostics(ctx, enabled)
+		result.Answer = answer
+		return result, err
+	case "recovery":
+		action := configvoice.RecoveryAction(text)
+		if action == "" || e.Recovery == nil {
+			return result, errors.New("emergency recovery is unavailable")
+		}
+		answer, err := e.Recovery(ctx, action)
+		if err == nil {
+			reply.SuppressListening(ctx)
+		}
+		result.Answer = answer
+		return result, err
+	case "airplay":
+		if e.AirPlay == nil {
+			return Resolution{Route: "yandex"}, nil
+		}
+		action := airPlayCommand(text)
+		if decision.Source == "airplay_media" {
+			controller, ok := e.AirPlay.(AirPlayMediaController)
+			if !ok || !controller.Active(ctx) {
+				return Resolution{Route: "yandex"}, nil
+			}
+			action = airPlayMediaCommand(text)
+			if action == "" {
+				return result, errors.New("unknown AirPlay media control")
+			}
+			answer, err := controller.ControlMedia(ctx, action)
+			result.Answer = answer
+			return result, err
+		}
+		if action == "" {
+			return result, errors.New("unknown AirPlay control")
+		}
+		answer, err := e.AirPlay.Control(ctx, action)
+		if err == nil && action == "start" {
+			reply.SuppressListening(ctx)
+		}
+		result.Answer = answer
+		return result, err
 	case "music":
 		if e.Music == nil {
 			return result, errors.New("music playback is unavailable")
@@ -120,7 +181,19 @@ func (e *Engine) ResolveDecision(ctx context.Context, text string, decision Rout
 		if e.Home == nil {
 			return Resolution{Route: "yandex"}, nil
 		}
-		answer, err := e.Home.Handle(ctx, text)
+		question := e.stripModelPrefix(text)
+		var answer string
+		var err error
+		if contextual, ok := e.Home.(interface {
+			HandleDialogue(context.Context, string, []llm.Message) (string, error)
+		}); ok {
+			answer, err = contextual.HandleDialogue(ctx, question, snapshot.Messages)
+		} else {
+			answer, err = e.Home.Handle(ctx, question)
+		}
+		if !e.dialogue().Current(ctx, ticket) || (err == nil && !e.dialogue().CommitRoute(ctx, ticket, "home", question, answer, false)) {
+			return result, context.Canceled
+		}
 		result.Answer = answer
 		return result, err
 	case "llm":
@@ -145,9 +218,14 @@ func (e *Engine) Fallback(ctx context.Context, text string) (Resolution, error) 
 	if !e.dialogue().Current(ctx, ticket) {
 		return r, context.Canceled
 	}
-	messages := []llm.Message{{Role: "system", Content: promptOr(e.Prompts.Assistant, defaultAssistantPrompt)}}
+	system := e.SystemPrompt
+	if strings.TrimSpace(system) == "" {
+		system = defaultSystemPrompt
+	}
+	messages := []llm.Message{{Role: "system", Content: system + e.ttsInstructions()}}
 	messages = append(messages, snapshot.Messages...)
 	messages = append(messages, llm.Message{Role: "user", Content: text})
+	messages = e.modelMessages(messages)
 	private := snapshot.PrivateHistory
 	var answer string
 	var err error
@@ -161,13 +239,15 @@ func (e *Engine) Fallback(ctx context.Context, text string) (Resolution, error) 
 	if !e.dialogue().Current(ctx, ticket) {
 		return r, context.Canceled
 	}
-	if err == nil {
-		if !e.dialogue().Commit(ctx, ticket, text, answer, private) {
-			return r, context.Canceled
-		}
+	if err != nil {
+		r.Answer = answer
+		return r, err
 	}
-	r.Answer = answer
-	return r, err
+	r.setModelAnswer(answer, e.TTSMarkup)
+	if !e.dialogue().Commit(ctx, ticket, text, r.Answer, private) {
+		return Resolution{Route: r.Route}, context.Canceled
+	}
+	return r, nil
 }
 func containsOne(text string, needles []string) bool {
 	for _, s := range needles {
@@ -193,19 +273,18 @@ func (e *Engine) policy() *RoutingPolicy {
 }
 
 type RoutingStatus struct {
-	Revision    string
-	ActiveRules int
+	Revision          string
+	ActiveRules       int
+	ClassifierEnabled bool
+	DefaultRoute      string
 }
 
 func (e *Engine) RoutingStatus() RoutingStatus {
 	p := e.policy()
-	return RoutingStatus{Revision: p.revision, ActiveRules: len(p.rules)}
+	return RoutingStatus{Revision: p.revision, ActiveRules: len(p.rules), ClassifierEnabled: p.classifierEnabled, DefaultRoute: p.defaultRoute}
 }
 func (e *Engine) IsRefusal(text string) bool { return e.policy().isRefusal(text) }
 func IsRefusal(text string) bool             { return builtInRouting.isRefusal(text) }
-
-// UsesWakeWord reports whether an active routing rule has wake_word_any.
-func (e *Engine) UsesWakeWord() bool { return e.policy().wakeWord }
 func (e *Engine) Decide(ctx context.Context, text string) (decision RouteDecision) {
 	ctx, snapshot, ticket := e.dialogue().Start(ctx)
 	defer func() {
@@ -218,23 +297,39 @@ func (e *Engine) Decide(ctx context.Context, text string) (decision RouteDecisio
 		decision.prepared = true
 	}()
 	p := e.policy()
+	if configvoice.RecoveryAction(text) != "" {
+		return RouteDecision{Route: "recovery", Source: "bridge_recovery"}
+	}
+	if _, ok := configvoice.DiagnosticsCommand(text); ok {
+		return RouteDecision{Route: "diagnostics", Source: "bridge_diagnostics"}
+	}
+	if e.Configuration && configvoice.InConversation(text, snapshot.Messages) {
+		return RouteDecision{Route: "llm", Source: "bridge_configuration"}
+	}
+	if e.AirPlay != nil && airPlayCommand(text) != "" {
+		return RouteDecision{Route: "airplay", Source: "airplay"}
+	}
 	if isRetryCommand(text) {
 		return RouteDecision{Route: "llm", Source: "dialogue_retry"}
 	}
 	if dialogue.IsReset(text) {
 		return RouteDecision{Route: "llm", Source: "dialogue_reset"}
 	}
+	if controller, ok := e.AirPlay.(AirPlayMediaController); ok && airPlayMediaCommand(text) != "" && controller.Active(ctx) {
+		return RouteDecision{Route: "airplay", Source: "airplay_media"}
+	}
 	if e.Playback != nil && playback.Command(text) != "" && e.Playback.Active(ctx) {
 		return RouteDecision{Route: "playback", Source: "playback"}
 	}
-	if d, ok := p.match(text, WakeWord(ctx)); ok {
+	wakewordTag, _ := ctx.Value(wakewordTagKey{}).(string)
+	if d, ok := p.match(text, wakewordTag); ok {
 		if d.Route == "llm" && e.Music != nil && e.Music.CanStartMusic(text) {
 			d.Route = "music"
 		}
 		return d
 	}
 	// Addressing Alice or a custom wake word again leaves the conversation.
-	if Conversation(ctx) && WakeWord(ctx) == "" && !strings.HasPrefix(dialogue.Normalize(text), "алиса") {
+	if Conversation(ctx) && wakewordTag == "" && !strings.HasPrefix(dialogue.Normalize(text), "алиса") {
 		d := RouteDecision{Route: "llm", Source: "conversation"}
 		if e.Music != nil && e.Music.CanStartMusic(text) {
 			d.Route = "music"
@@ -242,9 +337,9 @@ func (e *Engine) Decide(ctx context.Context, text string) (decision RouteDecisio
 		return d
 	}
 	if len(snapshot.Messages) > 0 && dialogue.IsFollowup(text) {
-		return RouteDecision{Route: "llm", Source: "dialogue"}
+		return RouteDecision{Route: snapshot.Route, Source: "dialogue"}
 	}
-	if p.defaultRoute != "classify" {
+	if !p.classifierEnabled {
 		return RouteDecision{Route: p.defaultRoute, Source: "default"}
 	}
 	failed := RouteDecision{Route: p.classifier.OnError, Source: "classifier_error"}

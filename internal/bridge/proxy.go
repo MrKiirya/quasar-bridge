@@ -13,10 +13,11 @@ import (
 )
 
 type Proxy struct {
-	Journal    *journal.Writer
-	Upstream   string
-	Observer   func(direction string, kind websocket.MessageType, data []byte)
-	NewSession func(context.Context, Sender, Sender) Session
+	Journal       *journal.Writer
+	Subscriptions *SubscriptionMonitor
+	Upstream      string
+	Observer      func(direction string, kind websocket.MessageType, data []byte)
+	NewSession    func(context.Context, Sender, Sender) Session
 	// OnRoute is told the route of each native request, after the journal.
 	OnRoute func(id, route string)
 	// OnStart is told when a native request begins, before its route is known.
@@ -94,10 +95,12 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if n, ok := session.(*Native); ok {
 			n.OnRoute = routeHook(trace, p.OnRoute)
 			n.OnStart = p.OnStart
-			if trace != nil {
-				n.OnWakeWord = trace.wakeWord
-			}
 		}
+	}
+	if p.Subscriptions != nil {
+		session = p.Subscriptions.NewSession(up.Write, downSend, session)
+	}
+	if session != nil {
 		defer session.Close()
 	}
 	copyMessages := func(dst, src *websocket.Conn, direction string) {

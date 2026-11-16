@@ -24,6 +24,95 @@ type homeFixture struct {
 	fail       bool
 }
 
+func TestHomeClarificationUsesFreshAvailability(t *testing.T) {
+	fixture := &homeFixture{state: "unavailable"}
+	history := []llm.Message{
+		{Role: "user", Content: "Включи свет в кабинете"},
+		{Role: "assistant", Content: "Включить доступный светильник?"},
+	}
+	c := Controller{Tools: fixture, Planner: plannerFunc(func(_ context.Context, messages []llm.Message, structured bool) (string, error) {
+		if !structured || len(messages) != 4 || !strings.Contains(messages[3].Content, `"state":"unavailable"`) {
+			t.Errorf("home clarification did not use current inventory: %+v", messages)
+		}
+		return `{"answer":"Включаю свет","actions":[{"domain":"light","service":"turn_on","entity_id":"light.office","data":{}}]}`, nil
+	})}
+	if _, err := c.HandleDialogue(t.Context(), "да", history); err == nil || fixture.actions != 0 {
+		t.Fatalf("old consent bypassed current availability: err=%v actions=%d", err, fixture.actions)
+	}
+}
+
+func TestHomeClarificationPrefersTheNewRoom(t *testing.T) {
+	entities := []Entity{
+		{ID: "light.office", Name: "Свет в кабинете", State: "off", Area: "Кабинет"},
+		{ID: "light.bedroom", Name: "Свет в спальне", State: "on", Area: "Спальня"},
+	}
+	c := Controller{Tools: toolFunc(func(_ context.Context, name string, args map[string]any) (jsontext.Value, error) {
+		switch name {
+		case "ha_get_skill_guide":
+			return json.Marshal(map[string]any{"success": true})
+		case "ha_search":
+			if args["domain_filter"] == "light" {
+				return json.Marshal(map[string]any{"entities": entities, "has_more": false})
+			}
+			return json.Marshal(map[string]any{"entities": []Entity{}, "has_more": false})
+		case "ha_get_entity_exposure":
+			if args["entity_id"] != "light.bedroom" {
+				t.Error("previous room captured a new explicit room", args)
+			}
+			return json.Marshal(map[string]any{"exposed_to": map[string]any{"conversation": true}})
+		default:
+			t.Fatalf("read-only followup called %q", name)
+			return nil, nil
+		}
+	}), Planner: plannerFunc(func(_ context.Context, messages []llm.Message, _ bool) (string, error) {
+		inventory := messages[len(messages)-1].Content
+		if strings.Contains(inventory, "light.office") || !strings.Contains(inventory, "light.bedroom") {
+			t.Error("new room was not used for inventory", inventory)
+		}
+		return `{"answer":"В спальне свет включён.","actions":[]}`, nil
+	})}
+	answer, err := c.HandleDialogue(t.Context(), "а в спальне?", []llm.Message{{Role: "user", Content: "Горит ли свет в кабинете?"}, {Role: "assistant", Content: "В кабинете свет выключен."}})
+	if err != nil || answer != "В спальне свет включён." {
+		t.Fatal(answer, err)
+	}
+}
+
+func TestExplicitRoomsOverridePreviousRoom(t *testing.T) {
+	entities := []Entity{
+		{ID: "light.office", Name: "Свет в кабинете", State: "off", Area: "Кабинет"},
+		{ID: "light.bedroom", Name: "Свет в спальне", State: "off", Area: "Спальня"},
+	}
+	c := Controller{Tools: toolFunc(func(_ context.Context, name string, args map[string]any) (jsontext.Value, error) {
+		switch name {
+		case "ha_get_skill_guide":
+			return json.Marshal(map[string]any{"success": true})
+		case "ha_search":
+			if args["domain_filter"] == "light" {
+				return json.Marshal(map[string]any{"entities": entities, "has_more": false})
+			}
+			return json.Marshal(map[string]any{"entities": []Entity{}, "has_more": false})
+		case "ha_get_entity_exposure":
+			return json.Marshal(map[string]any{"exposed_to": map[string]any{"conversation": true}})
+		default:
+			t.Fatalf("unexpected tool %q", name)
+			return nil, nil
+		}
+	}), Planner: plannerFunc(func(_ context.Context, messages []llm.Message, _ bool) (string, error) {
+		inventory := messages[len(messages)-1].Content
+		if !strings.Contains(inventory, "light.office") || !strings.Contains(inventory, "light.bedroom") {
+			t.Errorf("explicit request for both rooms was narrowed by old office context: %s", inventory)
+		}
+		return `{"answer":"Уточните действие.","actions":[]}`, nil
+	})}
+	_, err := c.HandleDialogue(t.Context(), "Включи свет в кабинете и спальне", []llm.Message{
+		{Role: "user", Content: "Горит ли свет в кабинете?"},
+		{Role: "assistant", Content: "В кабинете свет выключен."},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 func (f *homeFixture) Call(ctx context.Context, name string, args map[string]any) (jsontext.Value, error) {
 	var value any
 	switch name {
@@ -94,6 +183,54 @@ func TestLightingRequestInventoryIncludesSwitchesWithoutAllSensors(t *testing.T)
 	}
 }
 
+func TestHomeConfirmsLightBrightnessResult(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		data    map[string]any
+		state   string
+		wantErr bool
+	}{
+		{"brightness_zero_off", map[string]any{"brightness": 0}, "off", false},
+		{"brightness_zero_still_on", map[string]any{"brightness": 0}, "on", true},
+		{"brightness_fraction_truncates_to_zero_off", map[string]any{"brightness": 0.5}, "off", false},
+		{"brightness_negative_clamps_to_zero_off", map[string]any{"brightness": -1}, "off", false},
+		{"brightness_mid_on", map[string]any{"brightness": 127}, "on", false},
+		{"brightness_max_on", map[string]any{"brightness": 255}, "on", false},
+		{"brightness_positive_still_off", map[string]any{"brightness": 127}, "off", true},
+		{"percent_zero_off", map[string]any{"brightness_pct": 0}, "off", false},
+		{"percent_zero_still_on", map[string]any{"brightness_pct": 0}, "on", true},
+		{"percent_positive_on", map[string]any{"brightness_pct": 50}, "on", false},
+		{"percent_rounds_to_zero_off", map[string]any{"brightness_pct": 0.1}, "off", false},
+		{"no_brightness_on", nil, "on", false},
+		{"no_brightness_still_off", nil, "off", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fixture := &homeFixture{state: "off"}
+			tools := toolFunc(func(ctx context.Context, name string, args map[string]any) (jsontext.Value, error) {
+				raw, err := fixture.Call(ctx, name, args)
+				if name == "ha_call_service" {
+					fixture.state = tc.state
+				}
+				return raw, err
+			})
+			c := Controller{Tools: tools, Domains: []string{"light"}, Planner: plannerFunc(func(context.Context, []llm.Message, bool) (string, error) {
+				b, err := json.Marshal(Plan{Actions: []Action{{Domain: "light", Service: "turn_on", EntityID: "light.office", Data: tc.data}}})
+				return string(b), err
+			})}
+			answer, err := c.Handle(t.Context(), "Установи яркость света в кабинете")
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("answer=%q error=%v", answer, err)
+			}
+			if fixture.actions != 1 {
+				t.Fatalf("service calls=%d want=1", fixture.actions)
+			}
+			if !tc.wantErr && answer == "" {
+				t.Fatal("no reply after confirmed action")
+			}
+		})
+	}
+}
+
 func TestHomeValidatesEntireBatchBeforeFirstAction(t *testing.T) {
 	fixture := &homeFixture{state: "off"}
 	c := Controller{Tools: fixture, Domains: []string{"light"}, Planner: plannerFunc(func(context.Context, []llm.Message, bool) (string, error) {
@@ -101,6 +238,15 @@ func TestHomeValidatesEntireBatchBeforeFirstAction(t *testing.T) {
 	})}
 	if _, err := c.Handle(t.Context(), "Включи свет"); err == nil || fixture.actions != 0 {
 		t.Fatalf("error=%v actions=%d", err, fixture.actions)
+	}
+}
+
+func TestHomeRejectsServiceMarkupInPlanAnswer(t *testing.T) {
+	c := Controller{Tools: &homeFixture{state: "off"}, Domains: []string{"light"}, Planner: plannerFunc(func(context.Context, []llm.Message, bool) (string, error) {
+		return `{"answer":"<think>рассуждения</think>Уточните комнату.","actions":[]}`, nil
+	})}
+	if answer, err := c.Handle(t.Context(), "Включи свет"); err == nil || answer != "" {
+		t.Fatalf("service markup accepted: answer=%q error=%v", answer, err)
 	}
 }
 
@@ -185,5 +331,37 @@ func TestStateQuestionCannotPlanPhysicalActions(t *testing.T) {
 	answer, err := c.Handle(t.Context(), "Горит ли свет в кабинете?")
 	if err != nil || answer != "Свет выключен." || f.actions != 0 {
 		t.Fatalf("answer=%q err=%v actions=%d", answer, err, f.actions)
+	}
+}
+
+// User story: the speaker reads home answers aloud, so a reply must name a
+// device the way people call it ("Свет в кабинете"), never by its Home
+// Assistant entity_id. The prompts ask for that, and the bridge also replaces
+// any entity_id the planner still writes, because the model can ignore a prompt.
+func TestHomeAnswerNamesDevicesWithoutEntityIDs(t *testing.T) {
+	for _, tc := range []struct {
+		name, question, reply, want string
+	}{
+		{"command_answer_with_id_in_brackets", "Включи свет в кабинете", "Свет в кабинете (light.office) уже включён.", "Свет в кабинете уже включён."},
+		{"command_answer_with_bare_id", "Включи свет в кабинете", "light.office уже включён.", "Свет в кабинете уже включён."},
+		{"state_answer_with_bare_id", "Горит ли свет в кабинете?", "light.office включён.", "Свет в кабинете включён."},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &homeFixture{state: "on"}
+			c := Controller{Tools: f, Domains: []string{"light"}, Planner: plannerFunc(func(_ context.Context, m []llm.Message, structured bool) (string, error) {
+				if !strings.Contains(m[0].Content, "Называй устройства по friendly_name") {
+					t.Fatalf("prompt does not ask for friendly names: %q", m[0].Content)
+				}
+				if !structured {
+					return tc.reply, nil
+				}
+				b, _ := json.Marshal(Plan{Answer: tc.reply, Actions: []Action{}})
+				return string(b), nil
+			})}
+			answer, err := c.Handle(t.Context(), tc.question)
+			if err != nil || answer != tc.want || f.actions != 0 {
+				t.Fatalf("answer=%q want=%q err=%v actions=%d", answer, tc.want, err, f.actions)
+			}
+		})
 	}
 }

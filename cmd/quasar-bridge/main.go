@@ -7,12 +7,14 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -26,23 +28,32 @@ import (
 	"quasarbridge/internal/indicator"
 	"quasarbridge/internal/journal"
 	"quasarbridge/internal/llm"
-	"quasarbridge/internal/wakeword"
+	"quasarbridge/internal/update"
 	"quasarbridge/internal/wire"
+	"quasarbridge/internal/yandex"
 )
 
 func main() {
+	version := flag.Bool("v", false, "print version and exit")
 	path := flag.String("config", "config.json", "configuration file")
-	query := flag.String("query", "", "run one text query for backend diagnostics")
+	query := flag.String("query", "", "run one text query for diagnostics with simulated speaker audio playback")
 	check := flag.Bool("check-backends", false, "check LLM and configured Home Assistant connectivity")
 	checkMCP := flag.Bool("check-mcp", false, "connect to configured MCP servers and list tools without executing them")
 	route := flag.String("route", "", "explain a route without executing home actions or generating an answer")
-	routeWake := flag.String("wake-word", "", "with -route: the custom wake word that opened the request")
 	validate := flag.Bool("check-config", false, "validate configuration without contacting backends")
+	listModels := flag.Bool("list-models", false, "list available LLM models as ID and quoted label (tab-separated); no model selection required")
+	probeCompat := flag.Bool("probe-llm-compat", false, "probe Chat Completions parameter compatibility and print a JSON override object without changing configuration")
+	chatGPTAuth := flag.String("chatgpt-auth", "", "manage ChatGPT subscription: login, status, logout or models")
+	chatGPTListen := flag.String("chatgpt-login-listen", "127.0.0.1:1455", "loopback address for ChatGPT browser sign-in (use SSH forwarding on a speaker)")
 	speakerAction := flag.String("speaker-endpoint", "", "apply or rollback the on-device loopback endpoint (requires writable firmware)")
 	speakerConfig := flag.String("speaker-config", "/system/vendor/quasar/quasar.cfg", "firmware configuration path")
 	speakerBackup := flag.String("speaker-backup", "/data/opt/quasar-bridge/endpoint-backup.json", "persistent endpoint backup")
 	speakerURL := flag.String("speaker-url", "ws://127.0.0.1:8443/uni.ws", "on-device bridge URL")
 	flag.Parse()
+	if *version {
+		fmt.Println(update.Version)
+		return
+	}
 	if *speakerAction != "" {
 		if err := setSpeakerEndpoint(*speakerConfig, *speakerBackup, *speakerURL, *speakerAction); err != nil {
 			fmt.Fprintln(os.Stderr, err)
@@ -51,14 +62,11 @@ func main() {
 		fmt.Println("Speaker endpoint updated; restart the voice service to apply")
 		return
 	}
-	logger := slog.New(slog.NewJSONHandler(os.Stderr, nil))
+	diagnosticLogs := newDiagnosticLog(1 << 20)
+	logger := slog.New(slog.NewJSONHandler(io.MultiWriter(os.Stderr, diagnosticLogs), nil))
 	slog.SetDefault(logger)
-	cfg, err := readConfig(*path)
-	if err != nil {
-		slog.Error("configuration rejected", "error", err)
-		os.Exit(1)
-	}
-	prompts, err := bridge.LoadPrompts(cfg.Prompts)
+	slog.Info("quasar-bridge starting", "version", update.Version)
+	cfg, err := readConfigForCommand(*path, *listModels || *chatGPTAuth != "")
 	if err != nil {
 		slog.Error("configuration rejected", "error", err)
 		os.Exit(1)
@@ -78,6 +86,15 @@ func main() {
 		diagnostics++
 	}
 	if *validate {
+		diagnostics++
+	}
+	if *chatGPTAuth != "" {
+		diagnostics++
+	}
+	if *listModels {
+		diagnostics++
+	}
+	if *probeCompat {
 		diagnostics++
 	}
 	if diagnostics > 1 {
@@ -100,8 +117,47 @@ func main() {
 		}
 		return
 	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if *probeCompat {
+		ctx, cancel := context.WithTimeout(ctx, 120*time.Second)
+		defer cancel()
+		parameters, err := newLLMClient(cfg, os.Getenv("QUASAR_LLM_API_KEY")).ProbeCompatibility(ctx, func(err error) {
+			writeLLMProviderError(os.Stderr, err)
+		})
+		if err != nil {
+			slog.Error("LLM compatibility check failed", "error", err)
+			os.Exit(1)
+		}
+		if parameters == nil {
+			parameters = map[string]any{}
+		}
+		data, err := json.Marshal(parameters, json.Deterministic(true))
+		if err != nil {
+			slog.Error("cannot encode LLM compatibility parameters")
+			os.Exit(1)
+		}
+		fmt.Println(string(data))
+		return
+	}
+	if *listModels {
+		if err := writeLLMModels(ctx, newLLMClient(cfg, os.Getenv("QUASAR_LLM_API_KEY")), os.Stdout); err != nil {
+			slog.Error("LLM model discovery failed", "error", err)
+			writeLLMProviderError(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
+	if *chatGPTAuth != "" {
+		if err := runChatGPTAuth(ctx, *chatGPTAuth, cfg.LLMChatGPTAuthFile, *chatGPTListen, os.Stdout); err != nil {
+			slog.Error("ChatGPT authentication command failed", "error", err)
+			os.Exit(1)
+		}
+		return
+	}
 	var clientCount, serverCount atomic.Int64
-	proxy := &bridge.Proxy{Upstream: cfg.Upstream, Observer: func(direction string, kind websocket.MessageType, data []byte) {
+	subscriptions := new(bridge.SubscriptionMonitor)
+	proxy := &bridge.Proxy{Subscriptions: subscriptions, Upstream: cfg.Upstream, Observer: func(direction string, kind websocket.MessageType, data []byte) {
 		d := wire.ClientToServer
 		var count int64
 		if direction == "server" {
@@ -146,13 +202,58 @@ func main() {
 		}
 	}}
 	logs := new(journal.Writer)
-	lc := &llm.Client{
-		BaseURL: cfg.LLMBaseURL, Model: cfg.LLMModel, APIKey: os.Getenv("QUASAR_LLM_API_KEY"),
-		API: cfg.LLMAPI, ReasoningEffort: cfg.LLMReasoningEffort,
-		MaxOutputTokens: cfg.LLMMaxOutputTokens, HostedTools: cfg.LLMHostedTools,
-		ChatParameters: cfg.LLMChatParameters,
+	lc := newLLMClient(cfg, os.Getenv("QUASAR_LLM_API_KEY"))
+	engine := &bridge.Engine{LLM: lc, SystemPrompt: cfg.LLMSystemPrompt, Dialogue: dialogue.New(cfg.DialogueContext), StripPrefixes: cfg.LLMStripPrefixes, TTSMarkup: cfg.LLMTTSMarkup}
+	// Recovery is a direct command path, independent of assistant tool settings
+	// and of the availability of either the classifier or the dialogue model.
+	engine.Recovery = func(ctx context.Context, action string) (string, error) {
+		if _, err := update.New(*path).Recover(ctx, action); err != nil {
+			return "", err
+		}
+		if action == "observe" {
+			return "Режим наблюдения сохранён. Перезапуск Bridge запланирован после этого ответа. После перезапуска запросы будут идти в Яндекс.", nil
+		}
+		return "Аварийный откат запланирован после этого ответа. После успешного восстановления подключения к Яндексу колонка перезагрузится.", nil
 	}
-	engine := &bridge.Engine{LLM: lc, Dialogue: dialogue.New(cfg.DialogueContext), Prompts: prompts}
+	configuration := &configurationControl{path: *path, active: cfg, engine: engine, logs: logs}
+	yandexQuery := func(ctx context.Context, text string, dialog *queryDialog) (string, error) {
+		configuration.mu.Lock()
+		timezone := configuration.active.AssistantTools.Timezone
+		configuration.mu.Unlock()
+		var client *yandex.Client
+		if dialog != nil {
+			client = dialog.yandex
+		}
+		if client == nil {
+			var err error
+			client, err = yandex.NewSpeaker(*speakerConfig, timezone)
+			if err != nil {
+				return "", err
+			}
+			if dialog != nil {
+				dialog.yandex = client
+			}
+		}
+		return client.Query(ctx, text)
+	}
+	configuration.restart = func(ctx context.Context) (any, error) { return update.New(*path).Restart(ctx) }
+	engine.Configuration = cfg.AssistantTools.Enabled && cfg.AssistantTools.Configuration
+	if cfg.Mode == "hybrid" {
+		engine.Diagnostics = configuration.SetDiagnosticsNetworkAccess
+	}
+	var airPlay *airPlayControl
+	cleanupAirPlay := sync.OnceFunc(func() { shutdownAirPlay(stop, airPlay) })
+	defer cleanupAirPlay()
+	if cfg.Mode == "hybrid" {
+		airPlay, err = newAirPlayControl(ctx, cfg.AirPlay)
+		if err != nil {
+			slog.Error("AirPlay configuration rejected", "error", err)
+			os.Exit(1)
+		}
+		if airPlay != nil {
+			engine.AirPlay = airPlay
+		}
+	}
 	var musicQueue *assistant.MusicQueue
 	var hc *home.Controller
 	if endpoint := os.Getenv("QUASAR_HOME_MCP_URL"); endpoint != "" {
@@ -169,7 +270,12 @@ func main() {
 		}
 		reader := assistant.NewWebReader(cfg.AssistantTools)
 		if cfg.AssistantTools.PlaySound && cfg.AssistantTools.Web {
-			if base := musicBaseURL(cfg); base != "" {
+			base := musicBaseURL(cfg)
+			if base == "" && *query != "" {
+				// Query captures playback without opening a queue server.
+				base = "https://query.invalid"
+			}
+			if base != "" {
 				var err error
 				musicQueue, err = assistant.NewMusicQueue(base, reader)
 				if err != nil {
@@ -185,21 +291,21 @@ func main() {
 			musicPlayback = assistant.NewMusicPlayback(musicQueue)
 			engine.Playback = musicPlayback
 		}
-		tools := &assistant.Tools{Config: cfg.AssistantTools, JournalConfig: source, WebReader: reader, Playback: musicPlayback}
+		tools := &assistant.Tools{Updater: update.New(*path), Configuration: configuration, Config: cfg.AssistantTools, JournalConfig: source, WebReader: reader, Playback: musicPlayback, TTSMarkup: cfg.LLMTTSMarkup}
+		if airPlay != nil {
+			tools.AirPlay = airPlay
+		}
 		engine.Music = tools
-		engine.Assistant = &assistant.Agent{Client: lc, Tools: tools, MaxRounds: cfg.AssistantTools.MaxRounds, MaxCalls: cfg.AssistantTools.MaxCalls}
+		engine.Assistant = &assistant.Agent{Client: lc, Tools: tools, SystemPrompt: cfg.AssistantTools.SystemPrompt, MaxRounds: cfg.AssistantTools.MaxRounds, MaxCalls: cfg.AssistantTools.MaxCalls}
 	}
 	if err := engine.SetRouting(cfg.Routing); err != nil {
 		slog.Error("routing rejected", "error", err)
 		os.Exit(1)
 	}
 	if *query != "" || *check || *route != "" {
-		ctx, cancel := context.WithTimeout(context.Background(), 75*time.Second)
+		ctx, cancel := context.WithTimeout(ctx, 75*time.Second)
 		defer cancel()
 		if *route != "" {
-			if *routeWake != "" {
-				ctx = bridge.WithWakeWord(ctx, *routeWake)
-			}
 			data, _ := json.Marshal(engine.Decide(ctx, *route))
 			fmt.Println(string(data))
 			return
@@ -207,7 +313,8 @@ func main() {
 		if *check {
 			_, err := lc.Complete(ctx, []llm.Message{{Role: "user", Content: "Ответь одним словом: связь"}}, false)
 			if err != nil {
-				slog.Error("LLM check failed")
+				slog.Error("LLM check failed", "error", err)
+				writeLLMProviderError(os.Stderr, err)
 				os.Exit(1)
 			}
 			if hc == nil {
@@ -222,7 +329,7 @@ func main() {
 			fmt.Printf("LLM: ok; Home Assistant: %d entities\n", len(entities))
 			return
 		}
-		r, err := engine.Resolve(ctx, *query)
+		r, err := resolveQuery(ctx, engine, musicQueue, *query, func(ctx context.Context, text string) (string, error) { return yandexQuery(ctx, text, nil) })
 		if err != nil {
 			slog.Error("query failed", "route", r.Route, "error", err)
 			os.Exit(1)
@@ -256,10 +363,6 @@ func main() {
 			}()
 		}
 
-		var wake *wakeword.Client
-		if cfg.WakeWord.Enabled {
-			wake = wakeword.New(cfg.WakeWord)
-		}
 		proxy.NewSession = func(ctx context.Context, up, down bridge.Sender) bridge.Session {
 			n := bridge.NewNative(ctx, up, down, engine)
 			n.GateText = false
@@ -268,9 +371,6 @@ func main() {
 			if cfg.LocalProgress.Enabled {
 				n.ProgressAfter = time.Duration(cfg.LocalProgress.AfterMS) * time.Millisecond
 				n.ProgressInterval = time.Duration(cfg.LocalProgress.IntervalMS) * time.Millisecond
-			}
-			if wake != nil {
-				n.WakeWord = wake.Word
 			}
 
 			return n
@@ -308,10 +408,36 @@ func main() {
 			}
 		}
 	}
+	startedAt := time.Now()
+	var panel *diagnosticsListener
+	status := func() map[string]any {
+		state := engine.RoutingStatus()
+		return map[string]any{"status": "ok", "mode": cfg.Mode, "airplay": airPlayHealth(airPlay), "client_frames": clientCount.Load(), "server_frames": serverCount.Load(), "routing_revision": state.Revision, "routing_rules": state.ActiveRules, "routing_classifier_enabled": state.ClassifierEnabled, "routing_default_route": state.DefaultRoute, "conversation_log_enabled": logs.Enabled(), "conversation_log_failures": logs.Failures(), "assistant_tools_enabled": cfg.AssistantTools.Enabled, "dialogue_context_enabled": cfg.DialogueContext.Enabled && cfg.Mode == "hybrid", "home_assistant_enabled": hc != nil && cfg.Mode == "hybrid", "mcp_servers_configured": mcpConfigured, "music_playback_enabled": musicQueue != nil, "speaker_subscriptions": subscriptions.Snapshot(), "route_indicator_enabled": ring != nil, "llm_conversation_enabled": cfg.LLMConversation}
+	}
+	panelStatus := func() map[string]any {
+		result := status()
+		result["run"] = diagnosticLogs.run
+		result["version"], result["llm_model"], result["llm_api"] = update.Version, cfg.LLMModel, cfg.LLMAPI
+		result["uptime_seconds"] = int64(time.Since(startedAt).Seconds())
+		result["diagnostics"] = map[string]any{"network_access": configuration.diagnosticsNetworkAccess(), "port": cfg.Diagnostics.Port, "address": panel.Address()}
+		return result
+	}
+	panelControl := diagnosticControl{Configuration: configuration, Engine: engine, Logs: logs, MusicQueue: musicQueue, Status: panelStatus, AirPlay: airPlay, Network: configuration.diagnosticsNetworkAccess, QueryBusy: new(atomic.Bool), YandexQuery: yandexQuery, Dialogs: newQueryDialogs(time.Duration(cfg.DialogueContext.TTLSeconds) * time.Second)}
+	registerPanel := func(m *http.ServeMux) {
+		registerDiagnostics(m, diagnosticLogs, func() map[string]any { return airPlayHealth(airPlay) }, configuration.diagnosticsNetworkAccess)
+		registerDiagnosticsAPI(m, panelControl)
+	}
+	registerPanel(mux)
+	panelMux := http.NewServeMux()
+	registerPanel(panelMux)
+	panelMux.HandleFunc("GET /{$}", diagnosticsAccess(configuration.diagnosticsNetworkAccess, func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/diagnostics/", http.StatusTemporaryRedirect)
+	}))
+	panel = newDiagnosticsListener(cfg.Diagnostics.Port, panelMux)
+	configuration.applyDiagnostics = panel.SetNetworkAccess
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		state := engine.RoutingStatus()
-		data, _ := json.Marshal(map[string]any{"status": "ok", "mode": cfg.Mode, "client_frames": clientCount.Load(), "server_frames": serverCount.Load(), "routing_revision": state.Revision, "routing_rules": state.ActiveRules, "conversation_log_enabled": logs.Enabled(), "conversation_log_failures": logs.Failures(), "assistant_tools_enabled": cfg.AssistantTools.Enabled, "dialogue_context_enabled": cfg.DialogueContext.Enabled && cfg.Mode == "hybrid", "home_assistant_enabled": hc != nil && cfg.Mode == "hybrid", "mcp_servers_configured": mcpConfigured, "music_playback_enabled": musicQueue != nil, "route_indicator_enabled": ring != nil, "wake_word_enabled": cfg.WakeWord.Enabled && cfg.Mode == "hybrid", "llm_conversation_enabled": cfg.LLMConversation && cfg.Mode == "hybrid"})
+		data, _ := json.Marshal(status())
 		_, _ = w.Write(data)
 	})
 	mux.Handle("/uni.ws", proxy)
@@ -333,18 +459,22 @@ func main() {
 		mux.ServeHTTP(w, r)
 	})
 	server := &http.Server{Addr: cfg.Listen, Handler: handler, ReadHeaderTimeout: 10 * time.Second}
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
+	listenersReady := make(chan struct{})
 	reloads := make(chan os.Signal, 1)
 	signal.Notify(reloads, syscall.SIGHUP)
 	defer signal.Stop(reloads)
 	go func() {
+		select {
+		case <-listenersReady:
+		case <-ctx.Done():
+			return
+		}
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-reloads:
-				if err := reloadRouting(*path, cfg, engine, logs); err != nil {
+				if _, err := configuration.Apply(ctx, "reload"); err != nil {
 					slog.Warn("routing_reload_rejected", "error", err)
 					continue
 				}
@@ -358,15 +488,50 @@ func main() {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = server.Shutdown(shutdownCtx)
+		_ = panel.Shutdown(shutdownCtx)
 	}()
 	slog.Info("listening", "address", cfg.Listen, "mode", cfg.Mode, "routing_revision", engine.RoutingStatus().Revision)
-	if cfg.TLSCert != "" && cfg.TLSKey != "" {
-		err = server.ListenAndServeTLS(cfg.TLSCert, cfg.TLSKey)
-	} else {
-		err = server.ListenAndServe()
-	}
+	err = serveBridgeHTTPWithDiagnostics(server, cfg.TLSCert, cfg.TLSKey, cleanupAirPlay, panel, cfg.Diagnostics.NetworkAccess, func() { close(listenersReady) })
 	if err != nil && !errors.Is(err, http.ErrServerClosed) {
 		slog.Error("listener failed")
 		os.Exit(1)
 	}
+}
+
+// Keep resource cleanup inside the serving call: main may exit after a listener
+// failure, and os.Exit does not run main's deferred functions.
+func serveBridgeHTTP(server *http.Server, cert, key string, cleanup func()) error {
+	return serveBridgeHTTPWithDiagnostics(server, cert, key, cleanup, nil, false)
+}
+
+func serveBridgeHTTPWithDiagnostics(server *http.Server, cert, key string, cleanup func(), panel *diagnosticsListener, network bool, ready ...func()) error {
+	defer cleanup()
+	// Reserve the existing service's address first: the new optional panel must
+	// never steal the primary port from an existing UniProxy installation.
+	listener, err := net.Listen("tcp", server.Addr)
+	if err != nil {
+		return err
+	}
+	defer listener.Close()
+	if panel != nil {
+		defer func() {
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = panel.Shutdown(shutdownCtx)
+		}()
+		if err := panel.SetNetworkAccess(network); err != nil {
+			slog.Error("diagnostics listener unavailable", "error", err)
+		} else {
+			slog.Info("diagnostics listening", "address", panel.Address(), "network_access", network)
+		}
+	}
+	// Queued startup reloads must run only after the initial bindings have been
+	// installed, so they cannot be overwritten by the original config snapshot.
+	for _, notify := range ready {
+		notify()
+	}
+	if cert != "" && key != "" {
+		return server.ServeTLS(listener, cert, key)
+	}
+	return server.Serve(listener)
 }

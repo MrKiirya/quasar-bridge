@@ -6,9 +6,9 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
-	header "github.com/freequasar/quasar-go-genproto/proto/alice/protos/api/alicekit/events/common/event_header"
-	stat "github.com/freequasar/quasar-go-genproto/proto/alice/protos/api/alicekit/events/request_stat"
-	client "github.com/freequasar/quasar-go-genproto/proto/alice/protos/api/alicekit/protocol/client"
+	header "github.com/skrashevich/quasar-go-genproto/proto/alice/protos/api/alicekit/events/common/event_header"
+	stat "github.com/skrashevich/quasar-go-genproto/proto/alice/protos/api/alicekit/events/request_stat"
+	client "github.com/skrashevich/quasar-go-genproto/proto/alice/protos/api/alicekit/protocol/client"
 
 	"quasarbridge/internal/wire"
 )
@@ -37,7 +37,7 @@ func TestDecideKeepsConversationAfterRules(t *testing.T) {
 			ctx = WithConversation(ctx)
 		}
 		if tc.wake != "" {
-			ctx = WithWakeWord(ctx, tc.wake)
+			ctx = context.WithValue(ctx, wakewordTagKey{}, stationWakewordTag(tc.wake))
 		}
 		if got := e.Decide(ctx, tc.text); got.Route != tc.route || got.Source != tc.source {
 			t.Errorf("%q conversation=%v: %+v", tc.text, tc.conversation, got)

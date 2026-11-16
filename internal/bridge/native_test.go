@@ -4,29 +4,33 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"encoding/json/v2"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"quasarbridge/internal/journal"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/coder/websocket"
-	common "github.com/freequasar/quasar-go-genproto/proto/alice/megamind/protos/common"
-	directives "github.com/freequasar/quasar-go-genproto/proto/alice/protos/api/alicekit/directives"
-	request "github.com/freequasar/quasar-go-genproto/proto/alice/protos/api/alicekit/events/alice_request"
-	response "github.com/freequasar/quasar-go-genproto/proto/alice/protos/api/alicekit/events/alice_response"
-	asr "github.com/freequasar/quasar-go-genproto/proto/alice/protos/api/alicekit/events/asr_result"
-	recognition "github.com/freequasar/quasar-go-genproto/proto/alice/protos/api/alicekit/events/asr_result/common"
-	cancellation "github.com/freequasar/quasar-go-genproto/proto/alice/protos/api/alicekit/events/cancel_request"
-	header "github.com/freequasar/quasar-go-genproto/proto/alice/protos/api/alicekit/events/common/event_header"
-	continuation "github.com/freequasar/quasar-go-genproto/proto/alice/protos/api/alicekit/events/continue_request"
-	tts "github.com/freequasar/quasar-go-genproto/proto/alice/protos/api/alicekit/events/tts_speak"
-	client "github.com/freequasar/quasar-go-genproto/proto/alice/protos/api/alicekit/protocol/client"
-	server "github.com/freequasar/quasar-go-genproto/proto/alice/protos/api/alicekit/protocol/server"
+	common "github.com/skrashevich/quasar-go-genproto/proto/alice/megamind/protos/common"
+	directives "github.com/skrashevich/quasar-go-genproto/proto/alice/protos/api/alicekit/directives"
+	request "github.com/skrashevich/quasar-go-genproto/proto/alice/protos/api/alicekit/events/alice_request"
+	response "github.com/skrashevich/quasar-go-genproto/proto/alice/protos/api/alicekit/events/alice_response"
+	asr "github.com/skrashevich/quasar-go-genproto/proto/alice/protos/api/alicekit/events/asr_result"
+	recognition "github.com/skrashevich/quasar-go-genproto/proto/alice/protos/api/alicekit/events/asr_result/common"
+	cancellation "github.com/skrashevich/quasar-go-genproto/proto/alice/protos/api/alicekit/events/cancel_request"
+	header "github.com/skrashevich/quasar-go-genproto/proto/alice/protos/api/alicekit/events/common/event_header"
+	continuation "github.com/skrashevich/quasar-go-genproto/proto/alice/protos/api/alicekit/events/continue_request"
+	tts "github.com/skrashevich/quasar-go-genproto/proto/alice/protos/api/alicekit/events/tts_speak"
+	client "github.com/skrashevich/quasar-go-genproto/proto/alice/protos/api/alicekit/protocol/client"
+	server "github.com/skrashevich/quasar-go-genproto/proto/alice/protos/api/alicekit/protocol/server"
+	eventsource "github.com/skrashevich/quasar-go-genproto/proto/alice/protos/data/event_source"
 	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
 
@@ -40,6 +44,124 @@ func (f resolverFunc) Resolve(ctx context.Context, s string) (Resolution, error)
 func aa(m proto.Message) []byte {
 	data, _ := proto.Marshal(m)
 	return append([]byte("AAPI"), data...)
+}
+
+func TestNativeFinalASRLogsOnlyAggregateMetadata(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		aggregate *recognition.TAggregatedRecognition
+		present   bool
+		index     float64
+		textBytes float64
+	}{
+		{name: "absent"},
+		{name: "present", aggregate: &recognition.TAggregatedRecognition{Index: new(uint64(7)), RecognizedText: new("личный текст"), IsFinal: new(true)}, present: true, index: 7, textBytes: 23},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var logs bytes.Buffer
+			previous := slog.Default()
+			slog.SetDefault(slog.New(slog.NewJSONHandler(&logs, nil)))
+			t.Cleanup(func() { slog.SetDefault(previous) })
+			var forwarded []byte
+			n := NewNative(t.Context(), func(context.Context, websocket.MessageType, []byte) error { return nil }, func(_ context.Context, _ websocket.MessageType, data []byte) error {
+				forwarded = bytes.Clone(data)
+				return nil
+			}, nil)
+			t.Cleanup(n.Close)
+			voice := &client.TClientMessage{Message: &client.TClientMessage_Event{Event: &client.TClientMessage_TEvent{Header: &header.TEventHeader{MessageId: "asr-log"}, Event: &client.TClientMessage_TEvent_VoiceInput{VoiceInput: &request.TAliceRequestProto{Request: &request.TAliceRequestProto_TRequest{Event: &common.TEvent{Type: new(common.EEventType_voice_input)}}}}}}}
+			if err := n.Client(t.Context(), websocket.MessageBinary, aa(voice)); err != nil {
+				t.Fatal(err)
+			}
+			result := &server.TServerMessage{Message: &server.TServerMessage_Event{Event: &server.TServerMessage_TEvent{Header: &header.TEventHeader{RefMessageId: "asr-log"}, Event: &server.TServerMessage_TEvent_AsrResult{AsrResult: &asr.TAsrResult{EndOfUtt: new(true), AggregatedRecognition: tc.aggregate}}}}}
+			raw := protowire.AppendString(protowire.AppendTag(aa(result), 777, protowire.BytesType), "future-asr-field")
+			if err := n.Server(t.Context(), websocket.MessageBinary, raw); err != nil {
+				t.Fatal(err)
+			}
+			n.Close()
+			if !bytes.Equal(forwarded, raw) {
+				t.Fatal("ASR frame or unknown fields changed in transit")
+			}
+			if strings.Contains(logs.String(), "личный текст") {
+				t.Fatal("aggregate transcript leaked into diagnostics")
+			}
+			found := false
+			for line := range strings.SplitSeq(logs.String(), "\n") {
+				if line == "" {
+					continue
+				}
+				var event map[string]any
+				if err := json.Unmarshal([]byte(line), &event); err != nil {
+					t.Fatal(err)
+				}
+				if event["msg"] == "native_asr_final" {
+					found = true
+					if event["aggregate_present"] != tc.present || event["aggregate_final"] != tc.present || event["aggregate_index"] != tc.index || event["aggregate_text_bytes"] != tc.textBytes {
+						t.Fatalf("aggregate metadata=%v", event)
+					}
+				}
+				if event["msg"] == "native_asr_aggregate" && event["end_of_utt"] != true {
+					t.Fatalf("completed ASR aggregate boundary=%v", event["end_of_utt"])
+				}
+			}
+			if !found {
+				t.Fatal("final ASR diagnostic missing")
+			}
+		})
+	}
+}
+
+func TestNativeAggregateDiagnosticsAreBoundedPerRequest(t *testing.T) {
+	var logs bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+	n := NewNative(t.Context(), func(context.Context, websocket.MessageType, []byte) error { return nil }, func(context.Context, websocket.MessageType, []byte) error { return nil }, nil)
+	t.Cleanup(n.Close)
+	for _, id := range []string{"aggregate-a", "aggregate-b"} {
+		voice := &client.TClientMessage{Message: &client.TClientMessage_Event{Event: &client.TClientMessage_TEvent{Header: &header.TEventHeader{MessageId: id}, Event: &client.TClientMessage_TEvent_VoiceInput{VoiceInput: &request.TAliceRequestProto{Request: &request.TAliceRequestProto_TRequest{Event: &common.TEvent{Type: new(common.EEventType_voice_input)}}}}}}}
+		if err := n.Client(t.Context(), websocket.MessageBinary, aa(voice)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, packet := range []struct {
+		id    string
+		index uint64
+		final bool
+	}{
+		{"aggregate-a", 0, false},
+		{"aggregate-a", 1, false},
+		{"aggregate-a", 2, true},
+		{"aggregate-a", 3, true},
+		{"aggregate-b", 7, true},
+	} {
+		result := &server.TServerMessage{Message: &server.TServerMessage_Event{Event: &server.TServerMessage_TEvent{Header: &header.TEventHeader{RefMessageId: packet.id}, Event: &server.TServerMessage_TEvent_AsrResult{AsrResult: &asr.TAsrResult{AggregatedRecognition: &recognition.TAggregatedRecognition{Index: new(packet.index), RecognizedText: new("do not log this"), IsFinal: new(packet.final)}}}}}}
+		if err := n.Server(t.Context(), websocket.MessageBinary, aa(result)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	n.Close()
+	if strings.Contains(logs.String(), "do not log this") {
+		t.Fatal("aggregate transcript leaked into diagnostics")
+	}
+	var indexes []float64
+	for line := range strings.SplitSeq(logs.String(), "\n") {
+		if line == "" {
+			continue
+		}
+		var event map[string]any
+		if err := json.Unmarshal([]byte(line), &event); err != nil {
+			t.Fatal(err)
+		}
+		if event["msg"] == "native_asr_aggregate" {
+			if event["end_of_utt"] != false {
+				t.Fatalf("partial ASR aggregate boundary=%v", event["end_of_utt"])
+			}
+			indexes = append(indexes, event["aggregate_index"].(float64))
+		}
+	}
+	if !slices.Equal(indexes, []float64{0, 2, 7}) {
+		t.Fatalf("aggregate observations=%v; want first presence/final only per request", indexes)
+	}
 }
 
 func TestNativeListenAfterReply(t *testing.T) {
@@ -428,6 +550,101 @@ func TestVoiceRoutesOnlyAfterFinalASR(t *testing.T) {
 	}
 }
 
+func TestNativeRoutesByStationWakeword(t *testing.T) {
+	// UUIDs emitted by station-wakeword for these word IDs.
+	const jarvis = "1fb379a3-a415-567d-9bc5-977cd44928b3"
+	const house = "b4d13715-9d51-55e4-b3be-f26c7854284a"
+	cfg := DefaultRoutingConfig()
+	cfg.DefaultRoute = "yandex"
+	if err := json.Unmarshal([]byte(`[
+		{"name":"jarvis","route":"llm","match":{"wake_words":["джарвис"]}},
+		{"name":"house","route":"home","match":{"wake_words":["домовёнок"],"contains_any":["свет"]}}
+	]`), &cfg.Rules); err != nil {
+		t.Fatal(err)
+	}
+	var executed []string
+	e := &Engine{
+		LLM: completionFunc(func(_ context.Context, _ []llm.Message, _ bool) (string, error) {
+			executed = append(executed, "llm")
+			return "Готово", nil
+		}),
+		Home: homeFunc(func(_ context.Context, text string) (string, error) {
+			executed = append(executed, "home:"+text)
+			return "Готово", nil
+		}),
+	}
+	if err := e.SetRouting(cfg); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	send := func(context.Context, websocket.MessageType, []byte) error { return nil }
+	n := NewNative(ctx, send, send, e)
+	defer n.Close()
+	decisions := make(chan [2]string, 8)
+	n.OnRoute = func(id, route string) { decisions <- [2]string{id, route} }
+
+	for _, tc := range []struct {
+		id, kind, tag, text, route string
+		stockSource                bool
+	}{
+		{"tagged", "voice", jarvis, "включи свет", "llm", false},
+		{"upstream-v0.4.0", "voice", jarvis, "погода завтра", "llm", true},
+		{"next", "voice", "", "включи свет", "yandex", false},
+		{"other-word", "voice", house, "включи свет", "home", false},
+		{"text-condition", "voice", house, "погода завтра", "yandex", false},
+		{"unknown-tag", "voice", "93ed43e8-7215-5d99-87a0-c19266a62498", "джарвис, включи свет", "yandex", false},
+		{"text-input", "text", jarvis, "включи свет", "yandex", false},
+		{"speech-input", "speech", jarvis, "включи свет", "yandex", false},
+	} {
+		req := &request.TAliceRequestProto{Request: &request.TAliceRequestProto_TRequest{Event: &common.TEvent{}}}
+		if tc.tag != "" {
+			req.EventSource = &eventsource.TEventSource{Id: new(tc.tag)}
+		}
+		if tc.stockSource {
+			req.EventSource.Event = eventsource.TEventSource_Click
+			req.EventSource.Source = eventsource.TEventSource_Hardware
+			req.EventSource.Type = eventsource.TEventSource_Voice
+		}
+		input := &client.TClientMessage_TEvent{Header: &header.TEventHeader{MessageId: tc.id}}
+		switch tc.kind {
+		case "text":
+			req.Request.Event.Text = new(tc.text)
+			input.Event = &client.TClientMessage_TEvent_TextInput{TextInput: req}
+		case "speech":
+			input.Event = &client.TClientMessage_TEvent_SpeechInput{SpeechInput: req}
+		default:
+			input.Event = &client.TClientMessage_TEvent_VoiceInput{VoiceInput: req}
+		}
+		if err := n.Client(ctx, websocket.MessageBinary, aa(&client.TClientMessage{Message: &client.TClientMessage_Event{Event: input}})); err != nil {
+			t.Fatal(err)
+		}
+		if tc.kind != "text" {
+			result := &server.TServerMessage_TEvent{
+				Header: &header.TEventHeader{RefMessageId: tc.id},
+				Event: &server.TServerMessage_TEvent_AsrResult{AsrResult: &asr.TAsrResult{
+					EndOfUtt:    new(true),
+					Recognition: []*recognition.TAsrRecognition{{Normalized: new(tc.text)}},
+				}},
+			}
+			if err := n.Server(ctx, websocket.MessageBinary, aa(&server.TServerMessage{Message: &server.TServerMessage_Event{Event: result}})); err != nil {
+				t.Fatal(err)
+			}
+		}
+		select {
+		case got := <-decisions:
+			if got != [2]string{tc.id, tc.route} {
+				t.Fatalf("%s: decision %v, want %s", tc.id, got, tc.route)
+			}
+		case <-ctx.Done():
+			t.Fatalf("%s: no route decision", tc.id)
+		}
+	}
+	if !slices.Equal(executed, []string{"llm", "llm", "home:включи свет"}) {
+		t.Fatalf("unexpected backend calls: %v", executed)
+	}
+}
+
 func TestRefusalReplacementKeepsExecutorDirectives(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
@@ -568,69 +785,5 @@ func TestNativeReportsRequestStartBeforeRoute(t *testing.T) {
 		case <-ctx.Done():
 			t.Fatalf("missing %q", want)
 		}
-	}
-}
-
-type wakeResolver struct {
-	uses bool
-	got  chan string
-}
-
-func (r wakeResolver) Resolve(ctx context.Context, _ string) (Resolution, error) {
-	r.got <- WakeWord(ctx)
-	return Resolution{Route: "yandex"}, nil
-}
-func (r wakeResolver) UsesWakeWord() bool { return r.uses }
-
-func TestNativeWakeWordReachesResolverForVoiceOnly(t *testing.T) {
-	for _, tc := range []struct {
-		name       string
-		voice      bool
-		uses       bool
-		want       string
-		wantLookup bool
-	}{
-		{"voice", true, true, "товарищ", true},
-		{"text", false, true, "", false},
-		{"no rule", true, false, "", false},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			ctx, cancel := context.WithTimeout(t.Context(), time.Second)
-			defer cancel()
-			up := make(chan []byte, 16)
-			resolver := wakeResolver{uses: tc.uses, got: make(chan string, 1)}
-			n := NewNative(ctx, func(_ context.Context, _ websocket.MessageType, b []byte) error { up <- b; return nil }, func(context.Context, websocket.MessageType, []byte) error { return nil }, resolver)
-			defer n.Close()
-			var asked time.Time
-			n.WakeWord = func(_ context.Context, at time.Time) string { asked = at; return "  Товарищ " }
-			journaled := make(chan string, 1)
-			n.OnWakeWord = func(_, word string) { journaled <- word }
-			if tc.voice {
-				voice := aa(&client.TClientMessage{Message: &client.TClientMessage_Event{Event: &client.TClientMessage_TEvent{Header: &header.TEventHeader{MessageId: "voice", StreamId: new(int64(1))}, Event: &client.TClientMessage_TEvent_VoiceInput{VoiceInput: &request.TAliceRequestProto{Request: &request.TAliceRequestProto_TRequest{Event: &common.TEvent{Type: common.EEventType_voice_input.Enum()}}, Format: new("audio/opus")}}}}})
-				_ = n.Client(ctx, websocket.MessageBinary, voice)
-				<-up
-				result := aa(&server.TServerMessage{Message: &server.TServerMessage_Event{Event: &server.TServerMessage_TEvent{Header: &header.TEventHeader{RefMessageId: "voice"}, Event: &server.TServerMessage_TEvent_AsrResult{AsrResult: &asr.TAsrResult{EndOfUtt: new(true), Recognition: []*recognition.TAsrRecognition{{Normalized: new("как дела")}}}}}}})
-				_ = n.Server(ctx, websocket.MessageBinary, result)
-			} else {
-				text := aa(&client.TClientMessage{Message: &client.TClientMessage_Event{Event: &client.TClientMessage_TEvent{Header: &header.TEventHeader{MessageId: "text"}, Event: &client.TClientMessage_TEvent_TextInput{TextInput: &request.TAliceRequestProto{Request: &request.TAliceRequestProto_TRequest{Event: &common.TEvent{Type: common.EEventType_text_input.Enum(), Text: new("как дела")}}}}}}})
-				_ = n.Client(ctx, websocket.MessageBinary, text)
-			}
-			select {
-			case w := <-resolver.got:
-				if w != tc.want {
-					t.Fatalf("wake word %q, want %q", w, tc.want)
-				}
-				if asked.IsZero() == tc.wantLookup {
-					t.Fatalf("lookup called = %v, want %v", !asked.IsZero(), tc.wantLookup)
-				}
-			case <-ctx.Done():
-				t.Fatal("no decision")
-			}
-			if tc.want != "" {
-				if w := <-journaled; w != tc.want {
-					t.Fatalf("journaled %q", w)
-				}
-			}
-		})
 	}
 }
